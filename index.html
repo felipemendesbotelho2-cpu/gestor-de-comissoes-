@@ -184,21 +184,44 @@ const DB = {
       if(filters.to) list = list.filter(a => a.date <= filters.to);
       return list.sort((a,b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
     },
-    async add({ serviceId, employeeId, clientName, value, date }){
+    async add({ serviceId, employeeId, clientName, value, date, commissionPercent }){
       const employee = dbCache.users.find(u => u.id === employeeId && u.role === 'employee');
       if(!employee) throw new Error('Selecione um funcionário válido.');
       if(!(Number(value) > 0)) throw new Error('Informe um valor válido para o atendimento.');
-      const commissionValue = Number(value) * (Number(employee.commissionPercent)||0) / 100;
+      const pct = commissionPercent === undefined || commissionPercent === null || commissionPercent === ''
+        ? (Number(employee.commissionPercent)||0)
+        : Math.max(0, Math.min(100, Number(commissionPercent)||0));
+      const commissionValue = Number(value) * pct / 100;
       const a = {
         id: uid(), serviceId: serviceId || null, employeeId,
         clientName: (clientName||'').trim(), value: Number(value),
-        commissionPercentSnapshot: Number(employee.commissionPercent)||0,
+        commissionPercentSnapshot: pct,
         commissionValue, date: date || todayISO(),
         createdAt: new Date().toISOString(),
       };
       dbCache.appointments.push(a); persist();
       return a;
     },
+    async update(id, { serviceId, employeeId, clientName, value, date, commissionPercent }){
+      const a = dbCache.appointments.find(a => a.id === id);
+      if(!a) throw new Error('Atendimento não encontrado.');
+      const employee = dbCache.users.find(u => u.id === employeeId && u.role === 'employee');
+      if(!employee) throw new Error('Selecione um funcionário válido.');
+      if(!(Number(value) > 0)) throw new Error('Informe um valor válido para o atendimento.');
+      const pct = commissionPercent === undefined || commissionPercent === null || commissionPercent === ''
+        ? (Number(employee.commissionPercent)||0)
+        : Math.max(0, Math.min(100, Number(commissionPercent)||0));
+      a.serviceId = serviceId || null;
+      a.employeeId = employeeId;
+      a.clientName = (clientName||'').trim();
+      a.value = Number(value);
+      a.date = date || a.date;
+      a.commissionPercentSnapshot = pct;
+      a.commissionValue = Number(value) * pct / 100;
+      persist();
+      return a;
+    },
+    async get(id){ return dbCache.appointments.find(a => a.id === id) || null; },
     async remove(id){
       dbCache.appointments = dbCache.appointments.filter(a => a.id !== id);
       persist();
@@ -301,12 +324,6 @@ function renderLogin(){
           Entrar
         </button>
       </form>
-      <p class="text-center text-xs text-muted mt-5">
-        Primeiro acesso? Usuário <span class="mono font-semibold">admin</span> · senha <span class="mono font-semibold">admin123</span>
-      </p>
-      <button onclick="toggleTheme()" class="mx-auto mt-6 flex items-center gap-1.5 text-xs text-muted hover:text-ink dark:hover:text-white transition">
-        Alternar tema claro/escuro
-      </button>
     </div>
   </div>`;
 
@@ -673,14 +690,20 @@ async function pageAdminLaunch(){
       <td class="py-2.5 pr-3 text-sm dark:text-white/90">${escapeHtml(getUserName(a.employeeId))}</td>
       <td class="py-2.5 pr-3 text-sm text-muted">${escapeHtml(a.clientName || '—')}</td>
       <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(a.value)}</td>
-      <td class="py-2.5 pr-3 text-sm mono text-right text-accent">${fmtBRL(a.commissionValue)}</td>
-      <td class="py-2.5 pl-3 text-right"><button data-del-appt="${a.id}" class="text-xs font-semibold text-rose-600 hover:underline">Excluir</button></td>
+      <td class="py-2.5 pr-3 text-sm mono text-right text-accent">${fmtBRL(a.commissionValue)} <span class="text-muted">(${fmtPct(a.commissionPercentSnapshot)})</span></td>
+      <td class="py-2.5 pl-3 text-right whitespace-nowrap">
+        <button data-edit-appt="${a.id}" class="text-xs font-semibold text-accent hover:underline mr-3">Editar</button>
+        <button data-del-appt="${a.id}" class="text-xs font-semibold text-rose-600 hover:underline">Excluir</button>
+      </td>
     </tr>`).join('') : `<tr><td colspan="6" class="py-6 text-center text-sm text-muted">Nenhum atendimento lançado ainda.</td></tr>`;
 
   return `
     <div class="grid lg:grid-cols-[380px_1fr] gap-6 items-start">
       <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
-        <h2 class="text-sm font-bold mb-4 dark:text-white">Novo atendimento</h2>
+        <div class="flex items-center justify-between mb-4">
+          <h2 id="launch-form-title" class="text-sm font-bold dark:text-white">Novo atendimento</h2>
+          <button type="button" id="launch-cancel-edit" class="hidden text-xs font-semibold text-muted hover:underline">Cancelar edição</button>
+        </div>
         <form id="launch-form" class="space-y-3">
           <div>
             <label class="block text-xs font-semibold text-muted mb-1.5">Serviço</label>
@@ -704,12 +727,20 @@ async function pageAdminLaunch(){
               <input id="launch-date" type="date" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono">
             </div>
           </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Comissão neste atendimento</label>
+            <div class="relative">
+              <input id="launch-commission-pct" type="number" min="0" max="100" step="0.5" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="ex: 30">
+              <span class="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted">%</span>
+            </div>
+            <p class="text-[11px] text-muted mt-1">Vem preenchido com o % padrão do funcionário — mude aqui só se este atendimento tiver uma comissão diferente.</p>
+          </div>
           <div class="bg-accent-soft dark:bg-accent/10 rounded-lg px-3.5 py-3 flex items-center justify-between">
             <span class="text-xs font-semibold text-accent-dark dark:text-accent">Comissão estimada</span>
             <span id="launch-commission-preview" class="text-sm font-bold mono text-accent">R$ 0,00</span>
           </div>
           <div id="launch-error" class="text-xs text-rose-600 dark:text-rose-400 min-h-[1rem]"></div>
-          <button type="submit" class="w-full bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 hover:opacity-90 transition">Registrar atendimento</button>
+          <button type="submit" id="launch-submit-btn" class="w-full bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 hover:opacity-90 transition">Registrar atendimento</button>
         </form>
       </div>
 
@@ -729,42 +760,92 @@ async function pageAdminLaunch(){
     </div>`;
 }
 
+let launchEditingId = null;
+
 function attachLaunchHandlers(){
+  launchEditingId = null;
   const dateEl = document.getElementById('launch-date');
   dateEl.value = todayISO();
 
   const serviceSel = document.getElementById('launch-service');
   const employeeSel = document.getElementById('launch-employee');
   const valueEl = document.getElementById('launch-value');
+  const pctEl = document.getElementById('launch-commission-pct');
   const preview = document.getElementById('launch-commission-preview');
+  const titleEl = document.getElementById('launch-form-title');
+  const cancelBtn = document.getElementById('launch-cancel-edit');
+  const submitBtn = document.getElementById('launch-submit-btn');
 
   function updatePreview(){
-    const pct = Number(employeeSel.selectedOptions[0]?.dataset.pct || 0);
+    const pct = Number(pctEl.value || 0);
     const val = Number(valueEl.value || 0);
     preview.textContent = fmtBRL(val * pct / 100);
+  }
+  function fillDefaultCommission(){
+    const pct = employeeSel.selectedOptions[0]?.dataset.pct;
+    pctEl.value = pct !== undefined ? pct : '';
+    updatePreview();
   }
   serviceSel.addEventListener('change', () => {
     const price = serviceSel.selectedOptions[0]?.dataset.price;
     if(price) valueEl.value = Number(price).toFixed(2);
     updatePreview();
   });
-  employeeSel.addEventListener('change', updatePreview);
+  employeeSel.addEventListener('change', fillDefaultCommission);
   valueEl.addEventListener('input', updatePreview);
+  pctEl.addEventListener('input', updatePreview);
+  fillDefaultCommission();
+
+  function resetToCreateMode(){
+    launchEditingId = null;
+    titleEl.textContent = 'Novo atendimento';
+    submitBtn.textContent = 'Registrar atendimento';
+    cancelBtn.classList.add('hidden');
+    document.getElementById('launch-form').reset();
+    dateEl.value = todayISO();
+    fillDefaultCommission();
+  }
+  cancelBtn.addEventListener('click', resetToCreateMode);
 
   document.getElementById('launch-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const errEl = document.getElementById('launch-error');
     errEl.textContent = '';
+    const payload = {
+      serviceId: serviceSel.value || null,
+      employeeId: employeeSel.value,
+      clientName: document.getElementById('launch-client').value,
+      value: valueEl.value,
+      date: dateEl.value,
+      commissionPercent: pctEl.value,
+    };
     try{
-      await DB.appointments.add({
-        serviceId: serviceSel.value || null,
-        employeeId: employeeSel.value,
-        clientName: document.getElementById('launch-client').value,
-        value: valueEl.value,
-        date: dateEl.value,
-      });
+      if(launchEditingId){
+        await DB.appointments.update(launchEditingId, payload);
+      }else{
+        await DB.appointments.add(payload);
+      }
       await renderAdminShell();
     }catch(err){ errEl.textContent = err.message; }
+  });
+
+  document.querySelectorAll('[data-edit-appt]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const a = await DB.appointments.get(btn.dataset.editAppt);
+      if(!a) return;
+      launchEditingId = a.id;
+      serviceSel.value = a.serviceId || '';
+      employeeSel.value = a.employeeId;
+      document.getElementById('launch-client').value = a.clientName || '';
+      valueEl.value = a.value;
+      dateEl.value = a.date;
+      pctEl.value = a.commissionPercentSnapshot;
+      updatePreview();
+      titleEl.textContent = 'Editar atendimento';
+      submitBtn.textContent = 'Salvar alterações';
+      cancelBtn.classList.remove('hidden');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
   });
 
   document.querySelectorAll('[data-del-appt]').forEach(btn => {
