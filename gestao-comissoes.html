@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gestor de Comissões</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['Manrope', 'sans-serif'],
+          mono: ['"IBM Plex Mono"', 'monospace'],
+        },
+        colors: {
+          ink:    { DEFAULT: '#141A22', soft: '#1C2430' },
+          paper:  '#F0F3F5',
+          card:   '#FFFFFF',
+          line:   '#E1E6EA',
+          muted:  '#728093',
+          accent: { DEFAULT: '#0E6E63', soft: '#E4F1EE', dark: '#0A5147' },
+          gold:   { DEFAULT: '#C08A2E', soft: '#FBF1DF' },
+        }
+      }
+    }
+  }
+</script>
+<style>
+  :root{
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
+  }
+  *{ box-sizing: border-box; }
+  html{ scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body{
+    font-family: 'Manrope', sans-serif;
+    background: #F0F3F5;
+    color: #141A22;
+  }
+  html.dark body{ background:#10151C; color:#E7ECF1; }
+  .mono{ font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar{ height:8px; width:8px; }
+  ::-webkit-scrollbar-thumb{ background:#C7D0D8; border-radius:8px; }
+  html.dark ::-webkit-scrollbar-thumb{ background:#334051; }
+  .app-sidebar{ padding-top: env(safe-area-inset-top, 0px); }
+  .fade-in{ animation: fadeIn .25s ease; }
+  @keyframes fadeIn{ from{ opacity:0; transform:translateY(4px);} to{ opacity:1; transform:translateY(0);} }
+  input, select{ outline: none; }
+  input:focus, select:focus{ box-shadow: 0 0 0 3px rgba(14,110,99,.18); border-color:#0E6E63; }
+  @media (prefers-reduced-motion: reduce){ .fade-in{ animation:none; } }
+</style>
+</head>
+<body class="min-h-screen">
+
+<div id="app"></div>
+
+<script>
+/* =========================================================================
+   CAMADA DE DADOS (DB)
+   -------------------------------------------------------------------------
+   Tudo aqui simula um banco relacional (tabelas: users, services,
+   appointments) persistido em localStorage. As funções são assíncronas
+   de propósito: quando migrar para um backend real (ex. Supabase),
+   troque apenas o CORPO de cada método abaixo por chamadas ao SDK —
+   a "assinatura" (nome, parâmetros, retorno) pode continuar igual e o
+   resto do app (telas, formulários) não precisa mudar.
+
+   Exemplo de migração futura para Supabase (guia rápido):
+     const { data, error } = await supabase.from('users').select('*');
+     return data;
+   ========================================================================= */
+
+const STORAGE_KEY = 'gcx_data_v1';
+
+function loadDB(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(raw) return JSON.parse(raw);
+  }catch(e){ console.warn('Falha ao ler storage local, iniciando vazio.', e); }
+  return { users: [], services: [], appointments: [] };
+}
+let dbCache = loadDB();
+function persist(){
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(dbCache)); }
+  catch(e){ console.error('Falha ao salvar dados localmente.', e); }
+}
+
+async function sha256(text){
+  const enc = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+function uid(){
+  return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+}
+
+const DB = {
+  async seedIfEmpty(){
+    if(dbCache.users.length === 0){
+      const passwordHash = await sha256('admin123');
+      dbCache.users.push({
+        id: uid(), username: 'admin', passwordHash,
+        role: 'admin', name: 'Administrador(a)', commissionPercent: 0,
+        createdAt: new Date().toISOString(),
+      });
+      persist();
+    }
+  },
+
+  users: {
+    async list(){ return [...dbCache.users].sort((a,b)=> a.name.localeCompare(b.name)); },
+    async get(id){ return dbCache.users.find(u => u.id === id) || null; },
+    async add({ username, password, name, role, commissionPercent }){
+      username = (username||'').trim();
+      name = (name||'').trim();
+      if(!username || !password || !name) throw new Error('Preencha nome, usuário e senha.');
+      const dup = dbCache.users.some(u => u.username.toLowerCase() === username.toLowerCase());
+      if(dup) throw new Error('Já existe um usuário com esse nome de acesso.');
+      const passwordHash = await sha256(password);
+      const user = {
+        id: uid(), username, passwordHash, name,
+        role: role === 'admin' ? 'admin' : 'employee',
+        commissionPercent: role === 'employee' ? Math.max(0, Math.min(100, Number(commissionPercent)||0)) : 0,
+        createdAt: new Date().toISOString(),
+      };
+      dbCache.users.push(user); persist();
+      return user;
+    },
+    async update(id, patch){
+      const u = dbCache.users.find(u => u.id === id);
+      if(!u) throw new Error('Usuário não encontrado.');
+      if(patch.password){ u.passwordHash = await sha256(patch.password); }
+      if(patch.name !== undefined) u.name = patch.name.trim();
+      if(patch.commissionPercent !== undefined) u.commissionPercent = Math.max(0, Math.min(100, Number(patch.commissionPercent)||0));
+      persist();
+      return u;
+    },
+    async remove(id){
+      dbCache.users = dbCache.users.filter(u => u.id !== id);
+      dbCache.appointments = dbCache.appointments.filter(a => a.employeeId !== id);
+      persist();
+    },
+    async authenticate(username, password){
+      const u = dbCache.users.find(u => u.username.toLowerCase() === (username||'').trim().toLowerCase());
+      if(!u) return null;
+      const hash = await sha256(password);
+      return hash === u.passwordHash ? u : null;
+    }
+  },
+
+  services: {
+    async list(){ return [...dbCache.services].sort((a,b)=> a.name.localeCompare(b.name)); },
+    async add({ name, price }){
+      name = (name||'').trim();
+      if(!name || !(Number(price) > 0)) throw new Error('Informe nome e valor válido do serviço.');
+      const s = { id: uid(), name, price: Number(price) };
+      dbCache.services.push(s); persist();
+      return s;
+    },
+    async update(id, patch){
+      const s = dbCache.services.find(s => s.id === id);
+      if(!s) throw new Error('Serviço não encontrado.');
+      if(patch.name !== undefined) s.name = patch.name.trim();
+      if(patch.price !== undefined) s.price = Number(patch.price);
+      persist();
+      return s;
+    },
+    async remove(id){
+      dbCache.services = dbCache.services.filter(s => s.id !== id);
+      persist();
+    }
+  },
+
+  appointments: {
+    async list(filters = {}){
+      let list = [...dbCache.appointments];
+      if(filters.employeeId) list = list.filter(a => a.employeeId === filters.employeeId);
+      if(filters.from) list = list.filter(a => a.date >= filters.from);
+      if(filters.to) list = list.filter(a => a.date <= filters.to);
+      return list.sort((a,b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
+    },
+    async add({ serviceId, employeeId, clientName, value, date }){
+      const employee = dbCache.users.find(u => u.id === employeeId && u.role === 'employee');
+      if(!employee) throw new Error('Selecione um funcionário válido.');
+      if(!(Number(value) > 0)) throw new Error('Informe um valor válido para o atendimento.');
+      const commissionValue = Number(value) * (Number(employee.commissionPercent)||0) / 100;
+      const a = {
+        id: uid(), serviceId: serviceId || null, employeeId,
+        clientName: (clientName||'').trim(), value: Number(value),
+        commissionPercentSnapshot: Number(employee.commissionPercent)||0,
+        commissionValue, date: date || todayISO(),
+        createdAt: new Date().toISOString(),
+      };
+      dbCache.appointments.push(a); persist();
+      return a;
+    },
+    async remove(id){
+      dbCache.appointments = dbCache.appointments.filter(a => a.id !== id);
+      persist();
+    }
+  }
+};
+
+/* ========================= HELPERS DE FORMATAÇÃO ======================= */
+
+const fmtBRL = n => new Intl.NumberFormat('pt-BR', { style:'currency', currency:'BRL' }).format(Number(n)||0);
+const fmtPct = n => `${Number(n||0).toFixed(1).replace('.0','')}%`;
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+function monthRange(d = new Date()){
+  const from = new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0,10);
+  const to   = new Date(d.getFullYear(), d.getMonth()+1, 0).toISOString().slice(0,10);
+  return { from, to };
+}
+function fmtDateBR(iso){
+  if(!iso) return '—';
+  const [y,m,d] = iso.split('-');
+  return `${d}/${m}/${y}`;
+}
+function escapeHtml(str){
+  return String(str ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function getServiceName(id){
+  const s = dbCache.services.find(s => s.id === id);
+  return s ? s.name : '—';
+}
+function getUserName(id){
+  const u = dbCache.users.find(u => u.id === id);
+  return u ? u.name : '—';
+}
+
+/* =============================== ESTADO ================================ */
+
+let currentUser = null;
+let currentAdminPage = 'overview';
+let currentEmployeePage = 'meus';
+let formError = '';
+const root = document.getElementById('app');
+
+function getSession(){ return sessionStorage.getItem('gcx_session_uid'); }
+function setSession(id){ sessionStorage.setItem('gcx_session_uid', id); }
+function clearSession(){ sessionStorage.removeItem('gcx_session_uid'); }
+
+/* =============================== TEMA =================================== */
+
+function initTheme(){
+  const saved = localStorage.getItem('gcx_theme');
+  const wantsDark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.classList.toggle('dark', wantsDark);
+}
+function toggleTheme(){
+  const isDark = document.documentElement.classList.toggle('dark');
+  localStorage.setItem('gcx_theme', isDark ? 'dark' : 'light');
+}
+initTheme();
+
+/* ============================== BOOT ===================================== */
+
+async function boot(){
+  await DB.seedIfEmpty();
+  const uidSess = getSession();
+  if(uidSess){ currentUser = await DB.users.get(uidSess); if(!currentUser) clearSession(); }
+  render();
+}
+
+function render(){
+  formError = '';
+  if(!currentUser) return renderLogin();
+  if(currentUser.role === 'admin') return renderAdminShell();
+  return renderEmployeeShell();
+}
+
+/* ============================== LOGIN ==================================== */
+
+function renderLogin(){
+  root.innerHTML = `
+  <div class="min-h-screen flex items-center justify-center px-5 py-10">
+    <div class="w-full max-w-sm fade-in">
+      <div class="mb-8 text-center">
+        <div class="inline-flex items-center justify-center w-11 h-11 rounded-xl bg-accent text-white text-lg font-bold mb-4">%</div>
+        <h1 class="text-xl font-bold tracking-tight dark:text-white">Gestor de Comissões</h1>
+        <p class="text-sm text-muted mt-1">Entre com seu usuário para continuar</p>
+      </div>
+      <form id="login-form" class="bg-card dark:bg-ink-soft border border-line dark:border-[#293241] rounded-2xl p-6 space-y-4 shadow-sm">
+        <div>
+          <label class="block text-xs font-semibold text-muted mb-1.5">Usuário</label>
+          <input id="login-username" type="text" autocomplete="username" placeholder="ex: admin"
+            class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3.5 py-2.5 text-sm">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-muted mb-1.5">Senha</label>
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••"
+            class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3.5 py-2.5 text-sm">
+        </div>
+        <div id="login-error" class="text-xs text-rose-600 dark:text-rose-400 min-h-[1rem]"></div>
+        <button type="submit" class="w-full bg-ink dark:bg-accent hover:opacity-90 transition text-white text-sm font-semibold rounded-lg py-2.5">
+          Entrar
+        </button>
+      </form>
+      <p class="text-center text-xs text-muted mt-5">
+        Primeiro acesso? Usuário <span class="mono font-semibold">admin</span> · senha <span class="mono font-semibold">admin123</span>
+      </p>
+      <button onclick="toggleTheme()" class="mx-auto mt-6 flex items-center gap-1.5 text-xs text-muted hover:text-ink dark:hover:text-white transition">
+        Alternar tema claro/escuro
+      </button>
+    </div>
+  </div>`;
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = document.getElementById('login-username').value;
+    const password = document.getElementById('login-password').value;
+    const errEl = document.getElementById('login-error');
+    errEl.textContent = '';
+    if(!username || !password){ errEl.textContent = 'Preencha usuário e senha.'; return; }
+    const user = await DB.users.authenticate(username, password);
+    if(!user){ errEl.textContent = 'Usuário ou senha inválidos.'; return; }
+    currentUser = user;
+    setSession(user.id);
+    render();
+  });
+}
+
+function logout(){
+  currentUser = null;
+  clearSession();
+  render();
+}
+
+/* ============================ SHELL (layout) ============================= */
+
+function shellLayout({ navHtml, title, subtitle, contentHtml }){
+  root.innerHTML = `
+  <div class="min-h-screen flex dark:bg-[#10151C]">
+    <aside class="app-sidebar w-64 shrink-0 bg-ink text-white flex-col hidden md:flex">
+      ${sidebarInner(navHtml)}
+    </aside>
+
+    <div id="mobile-nav-backdrop" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden"></div>
+    <aside id="mobile-nav" class="app-sidebar w-72 shrink-0 bg-ink text-white flex-col fixed inset-y-0 left-0 z-50 -translate-x-full transition-transform duration-200 md:hidden flex">
+      ${sidebarInner(navHtml)}
+    </aside>
+
+    <div class="flex-1 min-w-0 flex flex-col">
+      <header class="sticky top-0 z-30 bg-paper/90 dark:bg-[#10151C]/90 backdrop-blur border-b border-line dark:border-[#22303F]" style="top: env(safe-area-inset-top, 0px);">
+        <div class="flex items-center justify-between gap-3 px-5 py-4">
+          <div class="flex items-center gap-3 min-w-0">
+            <button onclick="openMobileNav()" class="md:hidden shrink-0 w-9 h-9 rounded-lg border border-line dark:border-[#2C3949] flex items-center justify-center dark:text-white">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+            </button>
+            <div class="min-w-0">
+              <h1 class="text-base sm:text-lg font-bold tracking-tight truncate dark:text-white">${title}</h1>
+              <p class="text-xs text-muted truncate">${subtitle}</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <button onclick="toggleTheme()" title="Alternar tema" class="w-9 h-9 rounded-lg border border-line dark:border-[#2C3949] flex items-center justify-center dark:text-white text-muted">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+            </button>
+            <div class="hidden sm:flex flex-col items-end leading-tight">
+              <span class="text-sm font-semibold dark:text-white">${escapeHtml(currentUser.name)}</span>
+              <span class="text-[11px] text-muted">${currentUser.role === 'admin' ? 'Administrador(a)' : 'Funcionário(a)'}</span>
+            </div>
+            <button onclick="logout()" class="text-xs font-semibold border border-line dark:border-[#2C3949] rounded-lg px-3 py-2 dark:text-white hover:bg-white/60 dark:hover:bg-white/5 transition">Sair</button>
+          </div>
+        </div>
+      </header>
+      <main id="page-content" class="flex-1 px-5 py-6 max-w-6xl w-full mx-auto fade-in">
+        ${contentHtml}
+      </main>
+    </div>
+  </div>`;
+
+  document.getElementById('mobile-nav-backdrop')?.addEventListener('click', closeMobileNav);
+}
+
+function sidebarInner(navHtml){
+  return `
+    <div class="px-5 py-5 flex items-center justify-between border-b border-white/10">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-accent flex items-center justify-center text-sm font-bold">%</div>
+        <span class="font-bold tracking-tight text-[15px]">Gestor de Comissões</span>
+      </div>
+      <button onclick="closeMobileNav()" class="md:hidden w-7 h-7 flex items-center justify-center text-white/60">✕</button>
+    </div>
+    <nav class="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">${navHtml}</nav>
+    <div class="px-5 py-4 border-t border-white/10 text-[11px] text-white/40">
+      Logado como<br><span class="text-white/70 font-medium">${escapeHtml(currentUser.name)}</span>
+    </div>`;
+}
+
+function openMobileNav(){
+  document.getElementById('mobile-nav').classList.remove('-translate-x-full');
+  document.getElementById('mobile-nav-backdrop').classList.remove('hidden');
+}
+function closeMobileNav(){
+  document.getElementById('mobile-nav').classList.add('-translate-x-full');
+  document.getElementById('mobile-nav-backdrop').classList.add('hidden');
+}
+
+function navItem(icon, label, active, onclick){
+  return `
+  <button onclick="${onclick}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition
+    ${active ? 'bg-white/10 text-white' : 'text-white/55 hover:text-white hover:bg-white/5'}">
+    <span class="w-4 text-center">${icon}</span>${label}
+  </button>`;
+}
+
+/* =========================== PAINEL ADMIN ================================ */
+
+function goAdmin(page){ currentAdminPage = page; closeMobileNav(); renderAdminShell(); }
+
+async function renderAdminShell(){
+  const navHtml = [
+    navItem('◇','Visão geral', currentAdminPage==='overview', "goAdmin('overview')"),
+    navItem('◈','Funcionários', currentAdminPage==='employees', "goAdmin('employees')"),
+    navItem('◆','Serviços', currentAdminPage==='services', "goAdmin('services')"),
+    navItem('＋','Lançar atendimento', currentAdminPage==='launch', "goAdmin('launch')"),
+    navItem('▤','Relatório geral', currentAdminPage==='report', "goAdmin('report')"),
+  ].join('');
+
+  const titles = {
+    overview: ['Visão geral', 'Resumo do faturamento e comissões'],
+    employees: ['Funcionários', 'Cadastro e percentuais de comissão'],
+    services: ['Serviços', 'Catálogo de serviços e valores padrão'],
+    launch: ['Lançar atendimento', 'Registrar um serviço executado'],
+    report: ['Relatório geral', 'Comissões por período e funcionário'],
+  };
+  const [title, subtitle] = titles[currentAdminPage];
+
+  shellLayout({ navHtml, title, subtitle, contentHtml: `<div id="page-inner"></div>` });
+  const inner = document.getElementById('page-inner');
+
+  if(currentAdminPage === 'overview') inner.innerHTML = await pageAdminOverview();
+  if(currentAdminPage === 'employees') inner.innerHTML = await pageAdminEmployees();
+  if(currentAdminPage === 'services') inner.innerHTML = await pageAdminServices();
+  if(currentAdminPage === 'launch') inner.innerHTML = await pageAdminLaunch();
+  if(currentAdminPage === 'report') inner.innerHTML = await pageAdminReport();
+
+  attachAdminPageHandlers();
+}
+
+function attachAdminPageHandlers(){
+  if(currentAdminPage === 'employees') attachEmployeesHandlers();
+  if(currentAdminPage === 'services') attachServicesHandlers();
+  if(currentAdminPage === 'launch') attachLaunchHandlers();
+  if(currentAdminPage === 'report') attachReportHandlers();
+}
+
+/* --- Visão geral --- */
+async function pageAdminOverview(){
+  const { from, to } = monthRange();
+  const all = await DB.appointments.list({ from, to });
+  const employees = (await DB.users.list()).filter(u => u.role === 'employee');
+  const faturamento = all.reduce((s,a) => s + a.value, 0);
+  const comissoes = all.reduce((s,a) => s + a.commissionValue, 0);
+  const recentes = (await DB.appointments.list()).slice(0, 6);
+
+  const cards = [
+    ['Faturamento (mês)', fmtBRL(faturamento), 'text-ink dark:text-white'],
+    ['Comissões (mês)', fmtBRL(comissoes), 'text-accent'],
+    ['Atendimentos (mês)', all.length, 'text-ink dark:text-white'],
+    ['Funcionários ativos', employees.length, 'text-ink dark:text-white'],
+  ].map(([label, value, cls]) => `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+      <p class="text-xs font-semibold text-muted mb-2">${label}</p>
+      <p class="text-2xl font-bold mono ${cls}">${value}</p>
+    </div>`).join('');
+
+  const rows = recentes.length ? recentes.map(a => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${fmtDateBR(a.date)}</td>
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${escapeHtml(getUserName(a.employeeId))}</td>
+      <td class="py-2.5 pr-3 text-sm text-muted">${escapeHtml(getServiceName(a.serviceId))}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(a.value)}</td>
+      <td class="py-2.5 text-sm mono text-right text-accent">${fmtBRL(a.commissionValue)}</td>
+    </tr>`).join('') : `<tr><td colspan="5" class="py-6 text-center text-sm text-muted">Nenhum atendimento lançado ainda.</td></tr>`;
+
+  return `
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">${cards}</div>
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+      <div class="px-5 py-4 border-b border-line dark:border-[#22303F]">
+        <h2 class="text-sm font-bold dark:text-white">Últimos atendimentos</h2>
+      </div>
+      <div class="overflow-x-auto px-5">
+        <table class="w-full min-w-[560px]">
+          <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+            <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Funcionário</th><th class="pb-2 pt-4">Serviço</th>
+            <th class="pb-2 pt-4 text-right">Valor</th><th class="pb-2 pt-4 text-right">Comissão</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="h-2"></div>
+    </div>`;
+}
+
+/* --- Funcionários --- */
+async function pageAdminEmployees(){
+  const employees = (await DB.users.list()).filter(u => u.role === 'employee');
+  const rows = employees.length ? employees.map(u => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-3 pr-3 text-sm font-medium dark:text-white/90">${escapeHtml(u.name)}</td>
+      <td class="py-3 pr-3 text-sm mono text-muted">${escapeHtml(u.username)}</td>
+      <td class="py-3 pr-3 text-sm mono text-right dark:text-white/90">${fmtPct(u.commissionPercent)}</td>
+      <td class="py-3 pl-3 text-right whitespace-nowrap">
+        <button data-edit-emp="${u.id}" class="text-xs font-semibold text-accent hover:underline mr-3">Editar %</button>
+        <button data-del-emp="${u.id}" class="text-xs font-semibold text-rose-600 hover:underline">Excluir</button>
+      </td>
+    </tr>`).join('') : `<tr><td colspan="4" class="py-6 text-center text-sm text-muted">Nenhum funcionário cadastrado.</td></tr>`;
+
+  return `
+    <div class="grid lg:grid-cols-[1fr_360px] gap-6 items-start">
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+        <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Equipe</h2></div>
+        <div class="overflow-x-auto px-5">
+          <table class="w-full min-w-[480px]">
+            <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+              <th class="pb-2 pt-4">Nome</th><th class="pb-2 pt-4">Usuário</th><th class="pb-2 pt-4 text-right">Comissão</th><th class="pb-2 pt-4"></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="h-2"></div>
+      </div>
+
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <h2 class="text-sm font-bold mb-4 dark:text-white">Novo funcionário</h2>
+        <form id="employee-form" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Nome completo</label>
+            <input id="emp-name" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm" placeholder="Ex: Ana Souza">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Usuário de acesso</label>
+            <input id="emp-username" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="ex: ana.souza">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Senha inicial</label>
+            <input id="emp-password" type="text" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="mín. 4 caracteres">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Percentual de comissão</label>
+            <div class="relative">
+              <input id="emp-commission" type="number" min="0" max="100" step="0.5" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="ex: 30">
+              <span class="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted">%</span>
+            </div>
+          </div>
+          <div id="employee-error" class="text-xs text-rose-600 dark:text-rose-400 min-h-[1rem]"></div>
+          <button type="submit" class="w-full bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 hover:opacity-90 transition">Cadastrar funcionário</button>
+        </form>
+      </div>
+    </div>`;
+}
+
+function attachEmployeesHandlers(){
+  document.getElementById('employee-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('employee-error');
+    errEl.textContent = '';
+    try{
+      await DB.users.add({
+        name: document.getElementById('emp-name').value,
+        username: document.getElementById('emp-username').value,
+        password: document.getElementById('emp-password').value,
+        role: 'employee',
+        commissionPercent: document.getElementById('emp-commission').value,
+      });
+      await renderAdminShell();
+    }catch(err){ errEl.textContent = err.message; }
+  });
+
+  document.querySelectorAll('[data-edit-emp]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const u = await DB.users.get(btn.dataset.editEmp);
+      const novo = prompt(`Novo percentual de comissão para ${u.name} (atual: ${fmtPct(u.commissionPercent)}):`, u.commissionPercent);
+      if(novo === null) return;
+      const num = Number(novo);
+      if(isNaN(num) || num < 0 || num > 100){ alert('Informe um número entre 0 e 100.'); return; }
+      await DB.users.update(u.id, { commissionPercent: num });
+      await renderAdminShell();
+    });
+  });
+
+  document.querySelectorAll('[data-del-emp]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if(!confirm('Excluir este funcionário? Os atendimentos dele também serão removidos.')) return;
+      await DB.users.remove(btn.dataset.delEmp);
+      await renderAdminShell();
+    });
+  });
+}
+
+/* --- Serviços --- */
+async function pageAdminServices(){
+  const services = await DB.services.list();
+  const rows = services.length ? services.map(s => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-3 pr-3 text-sm font-medium dark:text-white/90">${escapeHtml(s.name)}</td>
+      <td class="py-3 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(s.price)}</td>
+      <td class="py-3 pl-3 text-right"><button data-del-service="${s.id}" class="text-xs font-semibold text-rose-600 hover:underline">Excluir</button></td>
+    </tr>`).join('') : `<tr><td colspan="3" class="py-6 text-center text-sm text-muted">Nenhum serviço cadastrado.</td></tr>`;
+
+  return `
+    <div class="grid lg:grid-cols-[1fr_340px] gap-6 items-start">
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+        <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Catálogo</h2></div>
+        <div class="overflow-x-auto px-5">
+          <table class="w-full min-w-[380px]">
+            <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+              <th class="pb-2 pt-4">Serviço</th><th class="pb-2 pt-4 text-right">Valor padrão</th><th class="pb-2 pt-4"></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="h-2"></div>
+      </div>
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <h2 class="text-sm font-bold mb-4 dark:text-white">Novo serviço</h2>
+        <form id="service-form" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Nome do serviço</label>
+            <input id="svc-name" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm" placeholder="Ex: Corte + Barba">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Valor padrão</label>
+            <input id="svc-price" type="number" min="0" step="0.01" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="0,00">
+          </div>
+          <div id="service-error" class="text-xs text-rose-600 dark:text-rose-400 min-h-[1rem]"></div>
+          <button type="submit" class="w-full bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 hover:opacity-90 transition">Cadastrar serviço</button>
+        </form>
+      </div>
+    </div>`;
+}
+
+function attachServicesHandlers(){
+  document.getElementById('service-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('service-error');
+    errEl.textContent = '';
+    try{
+      await DB.services.add({ name: document.getElementById('svc-name').value, price: document.getElementById('svc-price').value });
+      await renderAdminShell();
+    }catch(err){ errEl.textContent = err.message; }
+  });
+  document.querySelectorAll('[data-del-service]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if(!confirm('Excluir este serviço do catálogo?')) return;
+      await DB.services.remove(btn.dataset.delService);
+      await renderAdminShell();
+    });
+  });
+}
+
+/* --- Lançar atendimento --- */
+async function pageAdminLaunch(){
+  const services = await DB.services.list();
+  const employees = (await DB.users.list()).filter(u => u.role === 'employee');
+  const recentes = (await DB.appointments.list()).slice(0, 8);
+
+  const serviceOptions = `<option value="">Nenhum (valor livre)</option>` + services.map(s => `<option value="${s.id}" data-price="${s.price}">${escapeHtml(s.name)} · ${fmtBRL(s.price)}</option>`).join('');
+  const employeeOptions = employees.length
+    ? employees.map(u => `<option value="${u.id}" data-pct="${u.commissionPercent}">${escapeHtml(u.name)} · comissão ${fmtPct(u.commissionPercent)}</option>`).join('')
+    : `<option value="">Cadastre um funcionário primeiro</option>`;
+
+  const rows = recentes.length ? recentes.map(a => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${fmtDateBR(a.date)}</td>
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${escapeHtml(getUserName(a.employeeId))}</td>
+      <td class="py-2.5 pr-3 text-sm text-muted">${escapeHtml(a.clientName || '—')}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(a.value)}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right text-accent">${fmtBRL(a.commissionValue)}</td>
+      <td class="py-2.5 pl-3 text-right"><button data-del-appt="${a.id}" class="text-xs font-semibold text-rose-600 hover:underline">Excluir</button></td>
+    </tr>`).join('') : `<tr><td colspan="6" class="py-6 text-center text-sm text-muted">Nenhum atendimento lançado ainda.</td></tr>`;
+
+  return `
+    <div class="grid lg:grid-cols-[380px_1fr] gap-6 items-start">
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <h2 class="text-sm font-bold mb-4 dark:text-white">Novo atendimento</h2>
+        <form id="launch-form" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Serviço</label>
+            <select id="launch-service" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm">${serviceOptions}</select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Funcionário responsável</label>
+            <select id="launch-employee" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm">${employeeOptions}</select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">Cliente (opcional)</label>
+            <input id="launch-client" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm" placeholder="Nome do cliente">
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-semibold text-muted mb-1.5">Valor</label>
+              <input id="launch-value" type="number" min="0" step="0.01" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono" placeholder="0,00">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-muted mb-1.5">Data</label>
+              <input id="launch-date" type="date" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono">
+            </div>
+          </div>
+          <div class="bg-accent-soft dark:bg-accent/10 rounded-lg px-3.5 py-3 flex items-center justify-between">
+            <span class="text-xs font-semibold text-accent-dark dark:text-accent">Comissão estimada</span>
+            <span id="launch-commission-preview" class="text-sm font-bold mono text-accent">R$ 0,00</span>
+          </div>
+          <div id="launch-error" class="text-xs text-rose-600 dark:text-rose-400 min-h-[1rem]"></div>
+          <button type="submit" class="w-full bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 hover:opacity-90 transition">Registrar atendimento</button>
+        </form>
+      </div>
+
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+        <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Lançamentos recentes</h2></div>
+        <div class="overflow-x-auto px-5">
+          <table class="w-full min-w-[560px]">
+            <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+              <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Funcionário</th><th class="pb-2 pt-4">Cliente</th>
+              <th class="pb-2 pt-4 text-right">Valor</th><th class="pb-2 pt-4 text-right">Comissão</th><th class="pb-2 pt-4"></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="h-2"></div>
+      </div>
+    </div>`;
+}
+
+function attachLaunchHandlers(){
+  const dateEl = document.getElementById('launch-date');
+  dateEl.value = todayISO();
+
+  const serviceSel = document.getElementById('launch-service');
+  const employeeSel = document.getElementById('launch-employee');
+  const valueEl = document.getElementById('launch-value');
+  const preview = document.getElementById('launch-commission-preview');
+
+  function updatePreview(){
+    const pct = Number(employeeSel.selectedOptions[0]?.dataset.pct || 0);
+    const val = Number(valueEl.value || 0);
+    preview.textContent = fmtBRL(val * pct / 100);
+  }
+  serviceSel.addEventListener('change', () => {
+    const price = serviceSel.selectedOptions[0]?.dataset.price;
+    if(price) valueEl.value = Number(price).toFixed(2);
+    updatePreview();
+  });
+  employeeSel.addEventListener('change', updatePreview);
+  valueEl.addEventListener('input', updatePreview);
+
+  document.getElementById('launch-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('launch-error');
+    errEl.textContent = '';
+    try{
+      await DB.appointments.add({
+        serviceId: serviceSel.value || null,
+        employeeId: employeeSel.value,
+        clientName: document.getElementById('launch-client').value,
+        value: valueEl.value,
+        date: dateEl.value,
+      });
+      await renderAdminShell();
+    }catch(err){ errEl.textContent = err.message; }
+  });
+
+  document.querySelectorAll('[data-del-appt]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if(!confirm('Excluir este lançamento?')) return;
+      await DB.appointments.remove(btn.dataset.delAppt);
+      await renderAdminShell();
+    });
+  });
+}
+
+/* --- Relatório geral --- */
+let reportFilters = { from: monthRange().from, to: monthRange().to, employeeId: '' };
+
+async function pageAdminReport(){
+  const employees = (await DB.users.list()).filter(u => u.role === 'employee');
+  const list = await DB.appointments.list({ from: reportFilters.from, to: reportFilters.to, employeeId: reportFilters.employeeId || undefined });
+
+  const byEmployee = {};
+  for(const a of list){
+    if(!byEmployee[a.employeeId]) byEmployee[a.employeeId] = { faturamento: 0, comissao: 0, qtd: 0 };
+    byEmployee[a.employeeId].faturamento += a.value;
+    byEmployee[a.employeeId].comissao += a.commissionValue;
+    byEmployee[a.employeeId].qtd += 1;
+  }
+  const totalFaturamento = list.reduce((s,a)=> s + a.value, 0);
+  const totalComissao = list.reduce((s,a)=> s + a.commissionValue, 0);
+
+  const employeeOptions = `<option value="">Todos os funcionários</option>` + employees.map(u =>
+    `<option value="${u.id}" ${reportFilters.employeeId===u.id?'selected':''}>${escapeHtml(u.name)}</option>`).join('');
+
+  const summaryRows = Object.keys(byEmployee).length ? Object.entries(byEmployee).map(([empId, v]) => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-2.5 pr-3 text-sm font-medium dark:text-white/90">${escapeHtml(getUserName(empId))}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${v.qtd}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(v.faturamento)}</td>
+      <td class="py-2.5 text-sm mono text-right text-accent font-semibold">${fmtBRL(v.comissao)}</td>
+    </tr>`).join('') : `<tr><td colspan="4" class="py-6 text-center text-sm text-muted">Nenhum resultado para o período/filtro selecionado.</td></tr>`;
+
+  const detailRows = list.length ? list.map(a => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-2 pr-3 text-xs dark:text-white/80">${fmtDateBR(a.date)}</td>
+      <td class="py-2 pr-3 text-xs dark:text-white/80">${escapeHtml(getUserName(a.employeeId))}</td>
+      <td class="py-2 pr-3 text-xs text-muted">${escapeHtml(getServiceName(a.serviceId))}</td>
+      <td class="py-2 pr-3 text-xs text-muted">${escapeHtml(a.clientName || '—')}</td>
+      <td class="py-2 pr-3 text-xs mono text-right dark:text-white/80">${fmtBRL(a.value)}</td>
+      <td class="py-2 text-xs mono text-right text-accent">${fmtBRL(a.commissionValue)}</td>
+    </tr>`).join('') : '';
+
+  return `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5 mb-6">
+      <h2 class="text-sm font-bold mb-4 dark:text-white">Filtros</h2>
+      <form id="report-form" class="grid sm:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
+        <div>
+          <label class="block text-xs font-semibold text-muted mb-1.5">De</label>
+          <input id="report-from" type="date" value="${reportFilters.from}" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-muted mb-1.5">Até</label>
+          <input id="report-to" type="date" value="${reportFilters.to}" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm mono">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-muted mb-1.5">Funcionário</label>
+          <select id="report-employee" class="w-full rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm">${employeeOptions}</select>
+        </div>
+        <button type="submit" class="bg-ink dark:bg-accent text-white text-sm font-semibold rounded-lg py-2.5 px-5 hover:opacity-90 transition whitespace-nowrap">Filtrar</button>
+      </form>
+    </div>
+
+    <div class="grid grid-cols-2 gap-4 mb-6">
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <p class="text-xs font-semibold text-muted mb-2">Faturamento no período</p>
+        <p class="text-xl font-bold mono dark:text-white">${fmtBRL(totalFaturamento)}</p>
+      </div>
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <p class="text-xs font-semibold text-muted mb-2">Comissões a pagar</p>
+        <p class="text-xl font-bold mono text-accent">${fmtBRL(totalComissao)}</p>
+      </div>
+    </div>
+
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden mb-6">
+      <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Fechamento por funcionário</h2></div>
+      <div class="overflow-x-auto px-5">
+        <table class="w-full min-w-[420px]">
+          <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+            <th class="pb-2 pt-4">Funcionário</th><th class="pb-2 pt-4 text-right">Atend.</th><th class="pb-2 pt-4 text-right">Faturamento</th><th class="pb-2 pt-4 text-right">Comissão</th>
+          </tr></thead>
+          <tbody>${summaryRows}</tbody>
+        </table>
+      </div>
+      <div class="h-2"></div>
+    </div>
+
+    ${list.length ? `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+      <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Detalhamento</h2></div>
+      <div class="overflow-x-auto px-5 max-h-96 overflow-y-auto">
+        <table class="w-full min-w-[560px]">
+          <thead class="sticky top-0 bg-card dark:bg-ink-soft"><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+            <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Funcionário</th><th class="pb-2 pt-4">Serviço</th><th class="pb-2 pt-4">Cliente</th>
+            <th class="pb-2 pt-4 text-right">Valor</th><th class="pb-2 pt-4 text-right">Comissão</th>
+          </tr></thead>
+          <tbody>${detailRows}</tbody>
+        </table>
+      </div>
+      <div class="h-3"></div>
+    </div>` : ''}`;
+}
+
+function attachReportHandlers(){
+  document.getElementById('report-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    reportFilters = {
+      from: document.getElementById('report-from').value,
+      to: document.getElementById('report-to').value,
+      employeeId: document.getElementById('report-employee').value,
+    };
+    await renderAdminShell();
+  });
+}
+
+/* ========================= PAINEL FUNCIONÁRIO ============================ */
+
+function goEmployee(page){ currentEmployeePage = page; closeMobileNav(); renderEmployeeShell(); }
+
+async function renderEmployeeShell(){
+  const navHtml = [
+    navItem('◷','Resumo do mês', currentEmployeePage==='resumo', "goEmployee('resumo')"),
+    navItem('▤','Meus atendimentos', currentEmployeePage==='meus', "goEmployee('meus')"),
+  ].join('');
+
+  const titles = {
+    resumo: ['Resumo do mês', 'Suas comissões no mês atual'],
+    meus: ['Meus atendimentos', 'Serviços que você executou'],
+  };
+  const [title, subtitle] = titles[currentEmployeePage];
+
+  shellLayout({ navHtml, title, subtitle, contentHtml: `<div id="page-inner"></div>` });
+  const inner = document.getElementById('page-inner');
+  inner.innerHTML = currentEmployeePage === 'resumo' ? await pageEmployeeResumo() : await pageEmployeeMeus();
+}
+
+async function pageEmployeeResumo(){
+  const { from, to } = monthRange();
+  const list = await DB.appointments.list({ employeeId: currentUser.id, from, to });
+  const faturado = list.reduce((s,a)=> s + a.value, 0);
+  const comissao = list.reduce((s,a)=> s + a.commissionValue, 0);
+
+  const cards = [
+    ['Comissão do mês', fmtBRL(comissao), 'text-accent'],
+    ['Total atendido por você', fmtBRL(faturado), 'text-ink dark:text-white'],
+    ['Atendimentos no mês', list.length, 'text-ink dark:text-white'],
+  ].map(([label, value, cls]) => `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+      <p class="text-xs font-semibold text-muted mb-2">${label}</p>
+      <p class="text-2xl font-bold mono ${cls}">${value}</p>
+    </div>`).join('');
+
+  return `
+    <div class="bg-accent-soft dark:bg-accent/10 border border-accent/20 rounded-2xl px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-2">
+      <span class="text-sm text-accent-dark dark:text-accent font-medium">Seu percentual de comissão atual</span>
+      <span class="text-lg font-bold mono text-accent">${fmtPct(currentUser.commissionPercent)}</span>
+    </div>
+    <div class="grid sm:grid-cols-3 gap-4">${cards}</div>`;
+}
+
+async function pageEmployeeMeus(){
+  const list = await DB.appointments.list({ employeeId: currentUser.id });
+  const rows = list.length ? list.map(a => `
+    <tr class="border-t border-line dark:border-[#22303F]">
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${fmtDateBR(a.date)}</td>
+      <td class="py-2.5 pr-3 text-sm dark:text-white/90">${escapeHtml(getServiceName(a.serviceId))}</td>
+      <td class="py-2.5 pr-3 text-sm text-muted">${escapeHtml(a.clientName || '—')}</td>
+      <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(a.value)}</td>
+      <td class="py-2.5 text-sm mono text-right text-accent font-semibold">${fmtBRL(a.commissionValue)}</td>
+    </tr>`).join('') : `<tr><td colspan="5" class="py-8 text-center text-sm text-muted">Você ainda não tem atendimentos registrados.</td></tr>`;
+
+  return `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+      <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Histórico completo</h2></div>
+      <div class="overflow-x-auto px-5">
+        <table class="w-full min-w-[520px]">
+          <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+            <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Serviço</th><th class="pb-2 pt-4">Cliente</th>
+            <th class="pb-2 pt-4 text-right">Valor</th><th class="pb-2 pt-4 text-right">Sua comissão</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="h-2"></div>
+    </div>`;
+}
+
+/* =============================== START ==================================== */
+boot();
+</script>
+</body>
+</html>
