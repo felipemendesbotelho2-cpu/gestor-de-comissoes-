@@ -103,12 +103,29 @@ function uid(){
   return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 }
 
+/* Telefone: guarda só os dígitos (DDD + número, sem o 55) */
+function normalizePhone(raw){
+  let d = String(raw || '').replace(/\D/g, '');
+  if(d.startsWith('55') && d.length > 11) d = d.slice(2);
+  return d;
+}
+function fmtPhone(raw){
+  const d = normalizePhone(raw).slice(0, 11);
+  if(!d) return '';
+  if(d.length <= 2) return `(${d}`;
+  if(d.length <= 6) return `(${d.slice(0,2)}) ${d.slice(2)}`;
+  if(d.length <= 10) return `(${d.slice(0,2)}) ${d.slice(2,6)}-${d.slice(6)}`;
+  return `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7)}`;
+}
+
 /* Valida e monta os dados de um agendamento (usado em add e update) */
-function buildBookingData({ serviceId, employeeId, clientName, value, date, time, commissionPercent }, ignoreId){
+function buildBookingData({ serviceId, employeeId, clientName, clientPhone, value, date, time, commissionPercent }, ignoreId, skipPhone){
   const employee = dbCache.users.find(u => u.id === employeeId && u.role === 'employee');
   if(!employee) throw new Error('Selecione um funcionário válido.');
   clientName = (clientName||'').trim();
   if(!clientName) throw new Error('Informe o nome do cliente.');
+  const phone = normalizePhone(clientPhone);
+  if(!skipPhone && (phone.length < 10 || phone.length > 11)) throw new Error('Informe o WhatsApp da cliente com DDD. Ex: (63) 99999-9999');
   if(!date) throw new Error('Informe a data do agendamento.');
   if(!time) throw new Error('Informe o horário do agendamento.');
   if(!(Number(value) > 0)) throw new Error('Informe um valor válido para o serviço.');
@@ -119,9 +136,48 @@ function buildBookingData({ serviceId, employeeId, clientName, value, date, time
     ? (Number(employee.commissionPercent)||0)
     : Math.max(0, Math.min(100, Number(commissionPercent)||0));
   return {
-    serviceId: serviceId || null, employeeId, clientName,
+    serviceId: serviceId || null, employeeId, clientName, clientPhone: phone,
     value: Number(value), date, time, commissionPercentSnapshot: pct,
   };
+}
+
+/* Cada agendamento ativo gera automaticamente o lançamento (faturamento/comissão) */
+function createLinkedAppointment(b){
+  const a = {
+    id: uid(), serviceId: b.serviceId || null, employeeId: b.employeeId,
+    clientName: b.clientName, value: b.value,
+    commissionPercentSnapshot: b.commissionPercentSnapshot,
+    commissionValue: b.value * b.commissionPercentSnapshot / 100,
+    date: b.date, createdAt: new Date().toISOString(),
+  };
+  dbCache.appointments.push(a);
+  b.appointmentId = a.id;
+  return a;
+}
+function removeLinkedAppointment(b){
+  if(b.appointmentId) dbCache.appointments = dbCache.appointments.filter(a => a.id !== b.appointmentId);
+  b.appointmentId = null;
+}
+function syncAppointmentFromBooking(b){
+  const a = dbCache.appointments.find(x => x.id === b.appointmentId);
+  if(!a) return;
+  a.serviceId = b.serviceId || null;
+  a.employeeId = b.employeeId;
+  a.clientName = b.clientName;
+  a.value = b.value;
+  a.date = b.date;
+  a.commissionPercentSnapshot = b.commissionPercentSnapshot;
+  a.commissionValue = b.value * b.commissionPercentSnapshot / 100;
+}
+/* Ajusta agendamentos criados na versão anterior (que dependiam do botão "Concluir e lançar") */
+function migrateBookings(){
+  let changed = false;
+  dbCache.bookings.forEach(b => {
+    if(b.status === 'concluido'){ b.status = 'agendado'; changed = true; }
+    const hasAppt = b.appointmentId && dbCache.appointments.some(a => a.id === b.appointmentId);
+    if(b.status === 'agendado' && !hasAppt){ createLinkedAppointment(b); changed = true; }
+  });
+  if(changed) persist();
 }
 
 const DB = {
@@ -308,10 +364,8 @@ const DB = {
     async get(id){ return dbCache.appointments.find(a => a.id === id) || null; },
     async remove(id){
       dbCache.appointments = dbCache.appointments.filter(a => a.id !== id);
-      // se veio de um agendamento, ele volta a ficar "Agendado"
-      dbCache.bookings.forEach(b => {
-        if(b.appointmentId === id){ b.status = 'agendado'; b.appointmentId = null; }
-      });
+      // se veio de um agendamento, ele também é removido da agenda
+      dbCache.bookings = dbCache.bookings.filter(b => b.appointmentId !== id);
       persist();
     }
   },
@@ -333,14 +387,16 @@ const DB = {
     async add(data){
       const base = buildBookingData(data);
       const b = { id: uid(), ...base, status: 'agendado', appointmentId: null, createdAt: new Date().toISOString() };
-      dbCache.bookings.push(b); persist();
+      dbCache.bookings.push(b);
+      createLinkedAppointment(b);
+      persist();
       return b;
     },
     async update(id, data){
       const b = dbCache.bookings.find(b => b.id === id);
       if(!b) throw new Error('Agendamento não encontrado.');
-      if(b.status === 'concluido') throw new Error('Desfaça o lançamento antes de editar este agendamento.');
       Object.assign(b, buildBookingData(data, id));
+      if(b.status === 'agendado') syncAppointmentFromBooking(b);
       persist();
       return b;
     },
@@ -348,36 +404,19 @@ const DB = {
       const b = dbCache.bookings.find(b => b.id === id);
       if(!b) throw new Error('Agendamento não encontrado.');
       if(status === 'agendado'){
-        // reativar: confere se o horário continua livre
-        buildBookingData(b, id);
+        buildBookingData(b, id, true); // confere se o horário continua livre
+        b.status = 'agendado';
+        if(!b.appointmentId) createLinkedAppointment(b);
+      }else{
+        removeLinkedAppointment(b); // cancelado não conta no faturamento
+        b.status = status;
       }
-      b.status = status;
-      persist();
-      return b;
-    },
-    async complete(id){
-      const b = dbCache.bookings.find(b => b.id === id);
-      if(!b) throw new Error('Agendamento não encontrado.');
-      if(b.status !== 'agendado') throw new Error('Só é possível concluir agendamentos ativos.');
-      const a = await DB.appointments.add({
-        serviceId: b.serviceId, employeeId: b.employeeId, clientName: b.clientName,
-        value: b.value, date: b.date, commissionPercent: b.commissionPercentSnapshot,
-      });
-      b.status = 'concluido';
-      b.appointmentId = a.id;
-      persist();
-      return b;
-    },
-    async undoComplete(id){
-      const b = dbCache.bookings.find(b => b.id === id);
-      if(!b) throw new Error('Agendamento não encontrado.');
-      if(b.appointmentId) await DB.appointments.remove(b.appointmentId);
-      b.status = 'agendado';
-      b.appointmentId = null;
       persist();
       return b;
     },
     async remove(id){
+      const b = dbCache.bookings.find(b => b.id === id);
+      if(b) removeLinkedAppointment(b);
       dbCache.bookings = dbCache.bookings.filter(b => b.id !== id);
       persist();
     }
@@ -464,6 +503,7 @@ initTheme();
 
 async function boot(){
   await DB.seedIfEmpty();
+  migrateBookings();
   const uidSess = getSession();
   if(uidSess){ currentUser = await DB.users.get(uidSess); if(!currentUser) clearSession(); }
   render();
@@ -479,7 +519,7 @@ function render(){
 /* ============================== LOGIN ==================================== */
 
 const WHATSAPP_NUMBER = '5563993008899';
-function whatsappLink(text){ return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(text)}`; }
+function whatsappLink(text, number = WHATSAPP_NUMBER){ return `https://wa.me/${number}?text=${encodeURIComponent(text)}`; }
 
 function renderLogin(){
   // lê direto do cadastro: tudo que for cadastrado/editado/apagado no painel aparece aqui
@@ -699,14 +739,15 @@ async function pageAgenda(){
     const st = BOOKING_STATUS[b.status] || BOOKING_STATUS.agendado;
     const cancelled = b.status === 'cancelado';
     const commission = b.value * b.commissionPercentSnapshot / 100;
+    const firstName = (b.clientName || '').split(' ')[0];
+    const confirmMsg = `Olá, ${firstName}! Aqui é do Studio Vitória Vieira. Estou passando para confirmar seu horário de ${getServiceName(b.serviceId)} no dia ${fmtDateBR(b.date)} às ${b.time}. Está tudo certo?`;
+    const phoneHtml = b.clientPhone
+      ? `<a href="${whatsappLink(confirmMsg, '55' + b.clientPhone)}" target="_blank" rel="noopener" class="inline-block text-xs font-semibold text-accent hover:underline mt-1">WhatsApp ${fmtPhone(b.clientPhone)} · Confirmar horário</a>`
+      : `<span class="inline-block text-[11px] text-muted mt-1">Sem WhatsApp cadastrado (edite para adicionar)</span>`;
     const actions = [];
     if(b.status === 'agendado'){
-      actions.push(`<button data-bk-complete="${b.id}" class="text-xs font-semibold bg-accent text-white rounded-lg px-3 py-1.5 hover:opacity-90 transition">Concluir e lançar</button>`);
       actions.push(`<button data-bk-edit="${b.id}" class="text-xs font-semibold text-accent hover:underline">Editar</button>`);
       actions.push(`<button data-bk-cancel="${b.id}" class="text-xs font-semibold text-muted hover:underline">Cancelar</button>`);
-    }
-    if(b.status === 'concluido'){
-      actions.push(`<button data-bk-undo="${b.id}" class="text-xs font-semibold text-muted hover:underline">Desfazer lançamento</button>`);
     }
     if(b.status === 'cancelado'){
       actions.push(`<button data-bk-reopen="${b.id}" class="text-xs font-semibold text-accent hover:underline">Reativar</button>`);
@@ -721,6 +762,7 @@ async function pageAgenda(){
       <div class="flex-1 min-w-[170px]">
         <p class="text-sm font-semibold dark:text-white ${cancelled ? 'line-through' : ''}">${escapeHtml(getServiceName(b.serviceId))}</p>
         <p class="text-xs text-muted mt-0.5">Cliente: <span class="font-semibold text-ink dark:text-white/80">${escapeHtml(b.clientName)}</span>${isAdmin ? ' · ' + escapeHtml(getUserName(b.employeeId)) : ''}</p>
+        ${phoneHtml}
       </div>
       <div class="text-right">
         <p class="mono text-sm dark:text-white/90">${fmtBRL(b.value)}</p>
@@ -778,6 +820,11 @@ async function pageAgenda(){
           <div>
             <label class="block text-xs font-semibold text-muted mb-1.5">Cliente</label>
             <input id="ag-client" class="${inputCls}" placeholder="Nome do cliente">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-muted mb-1.5">WhatsApp da cliente</label>
+            <input id="ag-phone" type="tel" inputmode="tel" autocomplete="off" class="${inputCls} mono" placeholder="(63) 99999-9999">
+            <p class="text-[11px] text-muted mt-1">Usado para confirmar o horário com a cliente.</p>
           </div>
           <div>
             <label class="block text-xs font-semibold text-muted mb-1.5">Serviço</label>
@@ -845,6 +892,8 @@ function attachAgendaHandlers(){
   const serviceSel = document.getElementById('ag-service');
   const employeeSel = document.getElementById('ag-employee');
   const clientEl = document.getElementById('ag-client');
+  const phoneEl = document.getElementById('ag-phone');
+  phoneEl.addEventListener('input', () => { phoneEl.value = fmtPhone(phoneEl.value); });
   const dateEl = document.getElementById('ag-form-date');
   const timeEl = document.getElementById('ag-time');
   const valueEl = document.getElementById('ag-value');
@@ -895,6 +944,7 @@ function attachAgendaHandlers(){
       serviceId: serviceSel.value || null,
       employeeId: isAdmin ? employeeSel.value : currentUser.id,
       clientName: clientEl.value,
+      clientPhone: phoneEl.value,
       value: valueEl.value,
       date: dateEl.value,
       time: timeEl.value,
@@ -914,16 +964,8 @@ function attachAgendaHandlers(){
     catch(err){ alert(err.message); }
   };
 
-  document.querySelectorAll('[data-bk-complete]').forEach(btn => btn.addEventListener('click', () => {
-    if(!confirm('Concluir este atendimento e lançar no faturamento/comissões?')) return;
-    run(() => DB.bookings.complete(btn.dataset.bkComplete));
-  }));
-  document.querySelectorAll('[data-bk-undo]').forEach(btn => btn.addEventListener('click', () => {
-    if(!confirm('Desfazer o lançamento? O atendimento sai do faturamento e volta para "Agendado".')) return;
-    run(() => DB.bookings.undoComplete(btn.dataset.bkUndo));
-  }));
   document.querySelectorAll('[data-bk-cancel]').forEach(btn => btn.addEventListener('click', () => {
-    if(!confirm('Cancelar este agendamento?')) return;
+    if(!confirm('Cancelar este agendamento? Ele deixa de contar no faturamento e nas comissões.')) return;
     run(() => DB.bookings.setStatus(btn.dataset.bkCancel, 'cancelado'));
   }));
   document.querySelectorAll('[data-bk-reopen]').forEach(btn => btn.addEventListener('click', () => {
@@ -931,9 +973,7 @@ function attachAgendaHandlers(){
   }));
   document.querySelectorAll('[data-bk-del]').forEach(btn => btn.addEventListener('click', async () => {
     const b = await DB.bookings.get(btn.dataset.bkDel);
-    const msg = b && b.status === 'concluido'
-      ? 'Excluir este agendamento? O lançamento já feito continua valendo no faturamento.'
-      : 'Excluir este agendamento?';
+    const msg = 'Excluir este agendamento? Ele também sai do faturamento e das comissões.';
     if(!confirm(msg)) return;
     run(() => DB.bookings.remove(btn.dataset.bkDel));
   }));
@@ -943,6 +983,7 @@ function attachAgendaHandlers(){
     if(!b) return;
     agendaEditingId = b.id;
     clientEl.value = b.clientName;
+    phoneEl.value = b.clientPhone ? fmtPhone(b.clientPhone) : '';
     serviceSel.value = b.serviceId || '';
     if(isAdmin) employeeSel.value = b.employeeId;
     dateEl.value = b.date;
