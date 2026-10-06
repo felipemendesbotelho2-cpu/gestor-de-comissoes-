@@ -1814,6 +1814,96 @@ async function pageEmployeeMeus(){
 }
 
 /* =============================== START ==================================== */
+  /* ===== AJUSTES: logo branca + login no topo (estas funções substituem as antigas acima) ===== */
+function brandLogo(){
+  return `
+  <div class="rounded-3xl border border-[#C9A24A]/50 bg-white px-6 py-8 text-center shadow-xl">
+    <svg viewBox="0 0 100 100" class="w-20 h-20 sm:w-24 sm:h-24 mx-auto mb-4" role="img" aria-label="Logo Studio Vitória Vieira">
+      <defs>
+        <linearGradient id="logo-gold" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#D9B65D"/><stop offset=".5" stop-color="#B8892F"/><stop offset="1" stop-color="#8A6420"/>
+        </linearGradient>
+      </defs>
+      <circle cx="50" cy="50" r="48" fill="#FFFFFF" stroke="url(#logo-gold)" stroke-width="2.5"/>
+      <circle cx="50" cy="50" r="42" fill="none" stroke="url(#logo-gold)" stroke-width="0.8"/>
+      <text x="50" y="60" text-anchor="middle" font-family="'Cormorant Garamond', Georgia, serif" font-size="42" font-weight="700" letter-spacing="-2" fill="url(#logo-gold)">VV</text>
+      <path d="M34 67 H66" stroke="url(#logo-gold)" stroke-width="0.8"/>
+      <text x="50" y="78" text-anchor="middle" font-family="'Jost', sans-serif" font-size="6.2" letter-spacing="2.2" fill="#8A6420">STUDIO</text>
+    </svg>
+    <h1 class="logo-serif text-3xl sm:text-4xl font-semibold tracking-wide text-[#B8892F] leading-tight">Studio Vitória Vieira</h1>
+    <div class="flex items-center justify-center gap-3 my-3" aria-hidden="true">
+      <span class="h-px w-12 bg-gradient-to-r from-transparent to-[#C9A24A]"></span>
+      <span class="w-1.5 h-1.5 rotate-45 bg-[#C9A24A]"></span>
+      <span class="h-px w-12 bg-gradient-to-l from-transparent to-[#C9A24A]"></span>
+    </div>
+    <p class="logo-sans text-[11px] sm:text-xs uppercase tracking-[0.2em] text-[#A87D28] font-medium leading-relaxed">Unhas, Cílios, Sobrancelhas, Estética e Spa</p>
+  </div>`;
+}
+
+function renderLogin(){
+  const services = [...dbCache.services].sort((a,b)=> a.name.localeCompare(b.name));
+  const serviceCards = services.length ? services.map(s => {
+    const msg = `Olá! Gostaria de agendar o serviço "${s.name}" (${fmtBRL(s.price)}) no Studio Vitória Vieira. Quais horários você tem disponíveis?`;
+    return `
+      <a href="${whatsappLink(msg)}" target="_blank" rel="noopener"
+         class="group flex items-center justify-between gap-3 bg-card dark:bg-ink-soft border border-line dark:border-[#293241] hover:border-accent rounded-xl px-4 py-3.5 transition">
+        <span class="min-w-0">
+          <span class="block text-sm font-semibold dark:text-white truncate">${escapeHtml(s.name)}</span>
+          <span class="block text-xs text-muted mono mt-0.5">${fmtBRL(s.price)}</span>
+        </span>
+        <span class="shrink-0 text-[11px] font-semibold text-accent bg-accent-soft dark:bg-accent/15 rounded-full px-3 py-1.5 group-hover:bg-accent group-hover:text-white transition">Agendar</span>
+      </a>`;
+  }).join('') : `<p class="col-span-full text-center text-sm text-muted py-6">Em breve nossos serviços estarão disponíveis aqui.</p>`;
+
+  const otherMsg = 'Olá! Gostaria de agendar um horário no Studio Vitória Vieira.';
+  const inp = 'flex-1 min-w-[120px] rounded-lg border border-line dark:border-[#2C3949] dark:bg-[#151C25] dark:text-white px-3 py-2 text-sm';
+
+  root.innerHTML = `
+  <div class="min-h-screen flex flex-col">
+    <div class="px-3 sm:px-5 pt-3 sm:pt-4">
+      <form id="login-form" class="max-w-xl mx-auto bg-card dark:bg-ink-soft border border-line dark:border-[#293241] rounded-xl p-3 shadow-sm">
+        <div class="flex items-center gap-2 mb-2.5">
+          <span class="w-5 h-5 rounded-md bg-accent text-white text-[11px] font-bold flex items-center justify-center">%</span>
+          <span class="text-xs font-semibold text-muted tracking-wide">Painel de Administração</span>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <input id="login-username" type="text" autocomplete="username" placeholder="Usuário" class="${inp}">
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="Senha" class="${inp}">
+          <button type="submit" class="bg-ink dark:bg-accent hover:opacity-90 transition text-white text-sm font-semibold rounded-lg px-5 py-2">Entrar</button>
+        </div>
+        <div id="login-error" class="text-xs text-rose-600 dark:text-rose-400 mt-1.5 empty:hidden"></div>
+      </form>
+    </div>
+
+    <div class="flex-1 flex items-center justify-center px-5 py-8">
+      <div class="w-full max-w-xl fade-in">
+        <div class="mb-8">
+          ${brandLogo()}
+          <p class="text-xs text-muted mt-6 text-center">Escolha um serviço e agende pelo WhatsApp</p>
+        </div>
+        <div class="grid sm:grid-cols-2 gap-3">${serviceCards}</div>
+        <p class="text-center text-xs text-muted mt-6">
+          Outro serviço ou dúvida?
+          <a href="${whatsappLink(otherMsg)}" target="_blank" rel="noopener" class="font-semibold text-accent hover:underline">Fale com a gente</a>
+        </p>
+      </div>
+    </div>
+  </div>`;
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = document.getElementById('login-username').value;
+    const password = document.getElementById('login-password').value;
+    const errEl = document.getElementById('login-error');
+    errEl.textContent = '';
+    if(!username || !password){ errEl.textContent = 'Preencha usuário e senha.'; return; }
+    const user = await DB.users.authenticate(username, password);
+    if(!user){ errEl.textContent = 'Usuário ou senha inválidos.'; return; }
+    currentUser = user;
+    setSession(user.id);
+    render();
+  });
+}
 boot();
 </script>
 </body>
