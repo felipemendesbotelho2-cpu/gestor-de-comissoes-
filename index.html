@@ -1904,7 +1904,113 @@ function renderLogin(){
     render();
   });
 }
-boot();
+/* ===== AJUSTE: o % cadastrado é o que a EMPRESA recebe; a funcionária fica com o resto ===== */
+(function(){
+  function patch(name, pairs){
+    var src = String(window[name]);
+    pairs.forEach(function(p){
+      if(src.indexOf(p[0]) === -1){ console.warn('Ajuste não aplicado em ' + name + ':', p[0]); return; }
+      src = src.split(p[0]).join(p[1]);
+    });
+    window[name] = (0, eval)('(' + src + ')');
+  }
+
+  patch('pageAgenda', [
+    ['text-accent">comissão ${fmtBRL(commission)}', 'text-accent">empresa ${fmtBRL(commission)}'],
+    ['${isAdmin ? `<p class="mono text-[11px] text-gold">empresa ${fmtBRL(b.value - commission)}',
+     '${true ? `<p class="mono text-[11px] text-gold">${isAdmin ? "funcionária recebe" : "você recebe"} ${fmtBRL(b.value - commission)}'],
+    ['comissão prevista ${fmtBRL(comissaoPrevista)}', 'empresa prevista ${fmtBRL(comissaoPrevista)}'],
+    ['${isAdmin ? `<p class="mono text-[11px] text-gold">empresa ${fmtBRL(totalPrevisto - comissaoPrevista)}',
+     '${true ? `<p class="mono text-[11px] text-gold">${isAdmin ? "funcionárias recebem" : "você recebe"} ${fmtBRL(totalPrevisto - comissaoPrevista)}'],
+    ['· comissão ${fmtPct(u.commissionPercent)}', '· empresa ${fmtPct(u.commissionPercent)}'],
+    ['Comissão neste atendimento</label>', '% da empresa neste atendimento</label>'],
+    ['Vem com o % padrão do funcionário; mude só se este atendimento for diferente.', 'Vem com o % da empresa para este funcionário; mude só se este atendimento for diferente.'],
+    ['Comissão estimada</span>', 'Valor da empresa</span>']
+  ]);
+
+  patch('pageAdminOverview', [
+    ['Comissão da empresa (mês)', 'Fica com as funcionárias (mês)'],
+    ['Comissões das funcionárias (mês)', 'Comissão da empresa (mês)'],
+    ['text-right">Comissão</th>', 'text-right">Empresa</th>']
+  ]);
+
+  patch('pageAdminEmployees', [
+    ['text-right">Comissão</th>', 'text-right">% da empresa</th>'],
+    ['Percentual de comissão</label>', '% da empresa sobre os serviços</label>']
+  ]);
+
+  patch('attachEmployeesHandlers', [
+    ['Percentual de comissão para', 'Percentual da empresa para'],
+    ['Mudar a comissão de', 'Mudar o percentual da empresa de']
+  ]);
+
+  patch('pageAdminLaunch', [
+    ['· comissão ${fmtPct(u.commissionPercent)}', '· empresa ${fmtPct(u.commissionPercent)}'],
+    ['text-right">Comissão</th>', 'text-right">Empresa</th>'],
+    ['Comissão neste atendimento</label>', '% da empresa neste atendimento</label>'],
+    ['Vem preenchido com o % padrão do funcionário — mude aqui só se este atendimento tiver uma comissão diferente.', 'Vem preenchido com o % da empresa para este funcionário — mude só se este atendimento for diferente.'],
+    ['Comissão estimada</span>', 'Valor da empresa</span>']
+  ]);
+
+  patch('pageAdminReport', [
+    ['Empresa</th>', 'Funcionária</th>'],
+    ['Comissão func.</th>', 'Empresa</th>'],
+    ['Comissão da empresa</p>', 'Fica com as funcionárias</p>'],
+    ['Comissões a pagar (funcionárias)</p>', 'Comissão da empresa</p>']
+  ]);
+
+  /* Telas da funcionária: quanto ela recebe e quanto vai para a empresa */
+  window.pageEmployeeResumo = async function(){
+    const { from, to } = monthRange();
+    const list = await DB.appointments.list({ employeeId: currentUser.id, from, to });
+    const faturado = list.reduce((s,a)=> s + a.value, 0);
+    const empresa = list.reduce((s,a)=> s + a.commissionValue, 0);
+    const cards = [
+      ['Você recebe no mês', fmtBRL(faturado - empresa), 'text-accent'],
+      ['Repasse à empresa no mês', fmtBRL(empresa), 'text-gold'],
+      ['Total atendido por você', fmtBRL(faturado), 'text-ink dark:text-white'],
+      ['Atendimentos no mês', list.length, 'text-ink dark:text-white'],
+    ].map(([label, value, cls]) => `
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+        <p class="text-xs font-semibold text-muted mb-2">${label}</p>
+        <p class="text-xl font-bold mono ${cls}">${value}</p>
+      </div>`).join('');
+    return `
+      <div class="bg-accent-soft dark:bg-accent/10 border border-accent/20 rounded-2xl px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-2">
+        <span class="text-sm text-accent-dark dark:text-accent font-medium">Percentual da empresa sobre os seus serviços</span>
+        <span class="text-lg font-bold mono text-accent">${fmtPct(currentUser.commissionPercent)}</span>
+      </div>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">${cards}</div>`;
+  };
+
+  window.pageEmployeeMeus = async function(){
+    const list = await DB.appointments.list({ employeeId: currentUser.id });
+    const rows = list.length ? list.map(a => `
+      <tr class="border-t border-line dark:border-[#22303F]">
+        <td class="py-2.5 pr-3 text-sm dark:text-white/90">${fmtDateBR(a.date)}</td>
+        <td class="py-2.5 pr-3 text-sm dark:text-white/90">${escapeHtml(getServiceName(a.serviceId))}</td>
+        <td class="py-2.5 pr-3 text-sm text-muted">${escapeHtml(a.clientName || '—')}</td>
+        <td class="py-2.5 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(a.value)}</td>
+        <td class="py-2.5 pr-3 text-sm mono text-right text-gold">${fmtBRL(a.commissionValue)}</td>
+        <td class="py-2.5 text-sm mono text-right text-accent font-semibold">${fmtBRL(a.value - a.commissionValue)}</td>
+      </tr>`).join('') : `<tr><td colspan="6" class="py-8 text-center text-sm text-muted">Você ainda não tem atendimentos registrados.</td></tr>`;
+    return `
+      <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+        <div class="px-5 py-4 border-b border-line dark:border-[#22303F]"><h2 class="text-sm font-bold dark:text-white">Histórico completo</h2></div>
+        <div class="overflow-x-auto px-5">
+          <table class="w-full min-w-[560px]">
+            <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+              <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Serviço</th><th class="pb-2 pt-4">Cliente</th>
+              <th class="pb-2 pt-4 text-right">Valor</th><th class="pb-2 pt-4 text-right">Empresa</th><th class="pb-2 pt-4 text-right">Você recebe</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="h-2"></div>
+      </div>`;
+  };
+})();
+  boot();
 </script>
 </body>
 </html>
