@@ -60,13 +60,14 @@
 <body class="min-h-screen">
 
 <div id="app"></div>
-  <script>
+<script>
 (function(){
   var API = 'https://ecxhalvrziwknjgubcdn.supabase.co/rest/v1/studio_data';
   var KEY = 'sb_publishable_50x7AAendfE5HgnwOuruqg_HXu1kvrJ';
   var K = 'gcx_data_v1';
   var get = Storage.prototype.getItem, set = Storage.prototype.setItem;
   var blocked = false, last = null, chain = Promise.resolve(), remote = null;
+  var pending = 0, tbox = null, ttimer = null;
 
   function canon(o){
     if(Array.isArray(o)) return o.map(canon);
@@ -75,25 +76,49 @@
   }
   function stable(s){ try{ return JSON.stringify(canon(JSON.parse(s))); }catch(e){ return s; } }
 
+  function toast(msg, bad){
+    if(!tbox){
+      tbox = document.createElement('div');
+      tbox.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99999;padding:8px 12px;border-radius:10px;font:600 12px sans-serif;color:#fff;max-width:80vw;box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer';
+      tbox.onclick = function(){ tbox.style.display = 'none'; };
+      document.body.appendChild(tbox);
+    }
+    tbox.style.background = bad ? '#be123c' : '#0E6E63';
+    tbox.textContent = msg;
+    tbox.style.display = 'block';
+    clearTimeout(ttimer);
+    if(!bad) ttimer = setTimeout(function(){ tbox.style.display = 'none'; }, 2500);
+  }
+
   function upload(v){
-    last = stable(v);
+    pending++;
+    toast('Salvando online…');
     chain = chain.then(function(){
       var body = { data: JSON.parse(v), updated_at: new Date().toISOString() };
+      var json = JSON.stringify(body);
       var h = { apikey: KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' };
       function check(r){
         if(r.ok) return r.json();
-        return r.text().then(function(t){ throw new Error('HTTP ' + r.status + ' ' + t); });
+        return r.text().then(function(t){ throw new Error('HTTP ' + r.status + ' ' + t.slice(0, 200)); });
       }
-      return fetch(API + '?id=eq.1', { method: 'PATCH', headers: h, body: JSON.stringify(body) })
+      return fetch(API + '?id=eq.1', { method: 'PATCH', headers: h, body: json, keepalive: json.length < 60000 })
         .then(check)
         .then(function(rows){
           if(rows.length) return;
           body.id = 1;
-          return fetch(API, { method: 'POST', headers: h, body: JSON.stringify(body) }).then(check);
+          var j2 = JSON.stringify(body);
+          return fetch(API, { method: 'POST', headers: h, body: j2, keepalive: j2.length < 60000 }).then(check);
         });
-    }).catch(function(e){ console.error(e); alert('Não foi possível salvar online: ' + e.message); });
+    }).then(function(){
+      last = stable(v);
+      toast('Salvo online ✓');
+    }).catch(function(e){
+      console.error(e);
+      toast('ERRO ao salvar: ' + e.message, true);
+    }).then(function(){ pending--; });
   }
 
+  /* carrega os dados online antes do sistema iniciar */
   try{
     var x = new XMLHttpRequest();
     x.open('GET', API + '?id=eq.1&select=data', false);
@@ -125,11 +150,19 @@
     upload(v);
   };
 
+  /* avisa se tentar sair com um salvamento em andamento */
+  window.addEventListener('beforeunload', function(e){
+    if(pending > 0){ e.preventDefault(); e.returnValue = ''; }
+  });
+
+  /* ao voltar para a aba, recarrega se outro aparelho alterou os dados */
   document.addEventListener('visibilitychange', function(){
-    if(document.visibilityState !== 'visible' || blocked) return;
-    fetch(API + '?id=eq.1&select=data', { headers: { apikey: KEY } })
+    if(document.visibilityState !== 'visible' || blocked || pending > 0) return;
+    fetch(API + '?id=eq.1&select=data', { cache: 'no-store', headers: { apikey: KEY } })
       .then(function(r){ return r.json(); })
-      .then(function(rows){ if(rows.length && stable(JSON.stringify(rows[0].data)) !== last) location.reload(); })
+      .then(function(rows){
+        if(pending === 0 && rows.length && stable(JSON.stringify(rows[0].data)) !== last) location.reload();
+      })
       .catch(function(){});
   });
 })();
