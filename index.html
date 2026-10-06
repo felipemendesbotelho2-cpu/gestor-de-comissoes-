@@ -145,9 +145,13 @@
     return get.call(this, k);
   };
   Storage.prototype.setItem = function(k, v){
-    set.call(this, k, v);
-    if(this !== window.localStorage || k !== K || blocked) return;
-    upload(v);
+    var isData = (this === window.localStorage && k === K && !blocked);
+    try{ set.call(this, k, v); }
+    catch(e){
+      if(!isData) throw e;
+      console.warn('localStorage cheio, salvando só online', e);
+    }
+    if(isData) upload(v);
   };
 
   /* avisa se tentar sair com um salvamento em andamento */
