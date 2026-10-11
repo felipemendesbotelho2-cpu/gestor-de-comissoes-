@@ -2363,6 +2363,257 @@ function renderLogin(){
 })();
 
 /* >>> a linha boot(); continua logo abaixo deste bloco <<< */
+ /* =====================================================================
+   CONTROLE DE PAGAMENTO + ABA "A RECEBER"
+   Como usar: cole este bloco INTEIRO no seu arquivo, logo ANTES da linha
+       boot();
+   (depois dos outros blocos que você já colou, como o do agendamento online).
+
+   Como funciona por dentro:
+   - cada agendamento guarda quanto a cliente já pagou (pago / pagoTotal);
+   - o lançamento que entra no faturamento e nas comissões passa a ter só o
+     valor RECEBIDO. Quem não pagou nada não entra na conta; quem pagou parte
+     entra só com essa parte;
+   - agendamentos antigos (feitos antes desta atualização) continuam contando
+     como totalmente recebidos, para os relatórios de antes não mudarem.
+   ===================================================================== */
+
+/* quanto a cliente já pagou / quanto falta */
+function pagRecebido(b){ return b.pagoTotal ? Number(b.value) : (Number(b.pago) || 0); }
+function pagFalta(b){ return Math.max(0, Number(b.value) - pagRecebido(b)); }
+
+/* aceita "150", "150,50" e "1.500,50" */
+function pagNum(txt){
+  let t = String(txt).trim().replace(/[R$\s]/g, '');
+  if(t.indexOf(',') !== -1) t = t.replace(/\./g, '').replace(',', '.');
+  return Number(t);
+}
+
+/* agendamentos antigos já contavam como recebidos: continuam assim (só em memória, não grava nada sozinho) */
+function pagMigrar(){
+  dbCache.bookings.forEach(b => {
+    if(b.pagoTotal !== undefined || b.pago !== undefined) return;
+    if(b.status === 'cancelado'){ b.pago = 0; b.pagoTotal = false; }
+    else { b.pagoTotal = true; b.pago = Number(b.value); }
+  });
+}
+function migrateBookings(){ pagMigrar(); }
+
+/* o lançamento (faturamento/comissão) só existe, e só vale, pelo que foi RECEBIDO */
+function createLinkedAppointment(b){
+  if(b.pagoTotal === undefined && b.pago === undefined){ b.pago = 0; b.pagoTotal = false; }
+  const rec = pagRecebido(b);
+  if(rec <= 0) return null;
+  const a = {
+    id: uid(), serviceId: b.serviceId || null, employeeId: b.employeeId,
+    clientName: b.clientName, value: rec,
+    commissionPercentSnapshot: b.commissionPercentSnapshot,
+    commissionValue: rec * b.commissionPercentSnapshot / 100,
+    date: b.date, createdAt: new Date().toISOString(),
+  };
+  dbCache.appointments.push(a);
+  b.appointmentId = a.id;
+  return a;
+}
+function syncAppointmentFromBooking(b){
+  const rec = pagRecebido(b);
+  const a = dbCache.appointments.find(x => x.id === b.appointmentId);
+  if(rec <= 0){ if(a) removeLinkedAppointment(b); return; }
+  if(!a){ createLinkedAppointment(b); return; }
+  a.serviceId = b.serviceId || null;
+  a.employeeId = b.employeeId;
+  a.clientName = b.clientName;
+  a.value = rec;
+  a.date = b.date;
+  a.commissionPercentSnapshot = b.commissionPercentSnapshot;
+  a.commissionValue = rec * b.commissionPercentSnapshot / 100;
+}
+
+/* lançamentos que vieram da agenda têm o valor definido pelo pagamento: não editar pela tela "Lançar atendimento" */
+const pagApptUpdateOriginal = DB.appointments.update;
+DB.appointments.update = async function(id, data){
+  if(dbCache.bookings.some(b => b.appointmentId === id)){
+    throw new Error('Este lançamento veio do Agendamento. Para mudar o valor recebido, use "Registrar pagamento" na aba Agendamento ou em A receber.');
+  }
+  return pagApptUpdateOriginal.call(DB.appointments, id, data);
+};
+
+async function pagRegistrar(id, valor){
+  const b = dbCache.bookings.find(x => x.id === id);
+  if(!b) throw new Error('Agendamento não encontrado.');
+  if(valor >= Number(b.value)){ b.pagoTotal = true; b.pago = Number(b.value); }
+  else { b.pagoTotal = false; b.pago = Math.max(0, valor); }
+  if(b.status === 'agendado') syncAppointmentFromBooking(b);
+  persist();
+}
+
+/* atendimentos que já aconteceram e ainda têm valor a receber */
+function pagPendentes(){
+  const hoje = todayISO();
+  const ag = new Date();
+  const hhmm = String(ag.getHours()).padStart(2, '0') + ':' + String(ag.getMinutes()).padStart(2, '0');
+  return dbCache.bookings
+    .filter(b => b.status === 'agendado' && pagFalta(b) > 0 && (b.date < hoje || (b.date === hoje && (b.time || '') <= hhmm)))
+    .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
+}
+function pagTotalEmAberto(){ return pagPendentes().reduce((s, b) => s + pagFalta(b), 0); }
+
+/* selo de pagamento + botão (o botão só aparece para a administradora) */
+function pagChipHtml(b){
+  const rec = pagRecebido(b), falta = pagFalta(b);
+  const base = 'text-[11px] font-semibold rounded-full px-2.5 py-1';
+  let chip;
+  if(falta <= 0) chip = `<span class="${base} bg-accent-soft text-accent dark:bg-accent/15">Pago</span>`;
+  else if(rec > 0) chip = `<span class="${base} bg-gold-soft text-gold dark:bg-gold/15">Pagou ${fmtBRL(rec)} · falta ${fmtBRL(falta)}</span>`;
+  else chip = `<span class="${base} bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300">Não pagou</span>`;
+  const btn = (currentUser && currentUser.role === 'admin')
+    ? `<button data-bk-pay="${b.id}" class="text-xs font-semibold text-accent hover:underline">Registrar pagamento</button>` : '';
+  return chip + btn;
+}
+
+/* clique em "Registrar pagamento" (vale na agenda e na aba A receber) */
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest ? e.target.closest('[data-bk-pay]') : null;
+  if(!btn) return;
+  const b = dbCache.bookings.find(x => x.id === btn.dataset.bkPay);
+  if(!b) return;
+  const atual = pagRecebido(b);
+  const txt = prompt(
+    getServiceName(b.serviceId) + ' · ' + b.clientName + '\n' +
+    'Valor combinado: ' + fmtBRL(b.value) + '\n' +
+    'Já recebido: ' + fmtBRL(atual) + '\n\n' +
+    'Quanto a cliente já pagou NO TOTAL? (digite 0 se ainda não pagou)',
+    atual ? String(atual) : ''
+  );
+  if(txt === null) return;
+  const v = pagNum(txt);
+  if(isNaN(v) || v < 0){ alert('Informe um valor válido.'); return; }
+  try{ await pagRegistrar(b.id, v); await refreshApp(); }
+  catch(err){ alert(err.message); }
+});
+
+/* ---------------------------- ABA "A RECEBER" ---------------------------- */
+async function pageAdminReceber(){
+  const lista = pagPendentes();
+  const total = lista.reduce((s, b) => s + pagFalta(b), 0);
+
+  const cards = [
+    ['Total a receber das clientes', fmtBRL(total), 'text-rose-600'],
+    ['Atendimentos com pendência', lista.length, 'text-ink dark:text-white'],
+  ].map(([label, value, cls]) => `
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl p-5">
+      <p class="text-xs font-semibold text-muted mb-2">${label}</p>
+      <p class="text-xl font-bold mono ${cls}">${value}</p>
+    </div>`).join('');
+
+  const rows = lista.length ? lista.map(b => {
+    const rec = pagRecebido(b), falta = pagFalta(b);
+    const primeiro = (b.clientName || '').split(' ')[0];
+    const msg = `Olá, ${primeiro}! Aqui é do Studio Vitória Vieira. Passando para lembrar que ficou um valor de ${fmtBRL(falta)} pendente do seu atendimento de ${getServiceName(b.serviceId)} do dia ${fmtDateBR(b.date)}. Quando puder, pode nos enviar? Obrigada!`;
+    const cobrar = b.clientPhone
+      ? `<a href="${whatsappLink(msg, '55' + b.clientPhone)}" target="_blank" rel="noopener" class="block text-[11px] font-semibold text-accent hover:underline mt-0.5">Cobrar no WhatsApp</a>` : '';
+    const situacao = rec > 0
+      ? '<span class="text-[11px] font-semibold rounded-full px-2.5 py-1 bg-gold-soft text-gold dark:bg-gold/15">Pagou parte</span>'
+      : '<span class="text-[11px] font-semibold rounded-full px-2.5 py-1 bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300">Não pagou</span>';
+    return `
+    <tr class="border-t border-line dark:border-[#22303F] align-top">
+      <td class="py-3 pr-3 text-sm mono dark:text-white/90 whitespace-nowrap">${fmtDateBR(b.date)}<span class="block text-[11px] text-muted">${escapeHtml(b.time || '')}</span></td>
+      <td class="py-3 pr-3 text-sm dark:text-white/90"><span class="font-medium">${escapeHtml(b.clientName)}</span>${cobrar}</td>
+      <td class="py-3 pr-3 text-sm font-semibold dark:text-white/90">${escapeHtml(getServiceName(b.serviceId))}<span class="block text-[11px] font-normal text-muted">${escapeHtml(getUserName(b.employeeId))}</span></td>
+      <td class="py-3 pr-3 text-sm mono text-right dark:text-white/90">${fmtBRL(b.value)}</td>
+      <td class="py-3 pr-3 text-sm mono text-right text-accent">${fmtBRL(rec)}</td>
+      <td class="py-3 pr-3 text-sm mono text-right text-rose-600 font-semibold">${fmtBRL(falta)}<span class="block mt-1">${situacao}</span></td>
+      <td class="py-3 pl-3 text-right whitespace-nowrap"><button data-bk-pay="${b.id}" class="text-xs font-semibold text-accent hover:underline">Registrar pagamento</button></td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="7" class="py-8 text-center text-sm text-muted">Nenhuma pendência. Todos os atendimentos já realizados estão pagos.</td></tr>`;
+
+  return `
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">${cards}</div>
+    <div class="bg-card dark:bg-ink-soft border border-line dark:border-[#22303F] rounded-2xl overflow-hidden">
+      <div class="px-5 py-4 border-b border-line dark:border-[#22303F]">
+        <h2 class="text-sm font-bold dark:text-white">Procedimentos feitos com pagamento em aberto</h2>
+        <p class="text-xs text-muted mt-0.5">Só entra nos relatórios e nas comissões o que já foi recebido.</p>
+      </div>
+      <div class="overflow-x-auto px-5">
+        <table class="w-full min-w-[720px]">
+          <thead><tr class="text-left text-[11px] font-semibold text-muted uppercase tracking-wide">
+            <th class="pb-2 pt-4">Data</th><th class="pb-2 pt-4">Cliente</th><th class="pb-2 pt-4">Procedimento</th>
+            <th class="pb-2 pt-4 text-right">Combinado</th><th class="pb-2 pt-4 text-right">Recebido</th><th class="pb-2 pt-4 text-right">Falta pagar</th><th class="pb-2 pt-4"></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="h-2"></div>
+    </div>`;
+}
+
+/* menu do painel da administradora, agora com a aba "A receber" */
+async function renderAdminShell(){
+  const navHtml = [
+    navItem('◫','Agendamento', currentAdminPage==='agenda', "goAdmin('agenda')"),
+    navItem('◇','Visão geral', currentAdminPage==='overview', "goAdmin('overview')"),
+    navItem('◈','Funcionários', currentAdminPage==='employees', "goAdmin('employees')"),
+    navItem('◆','Serviços', currentAdminPage==='services', "goAdmin('services')"),
+    navItem('＋','Lançar atendimento', currentAdminPage==='launch', "goAdmin('launch')"),
+    navItem('$','A receber', currentAdminPage==='receber', "goAdmin('receber')"),
+    navItem('▤','Relatório geral', currentAdminPage==='report', "goAdmin('report')"),
+  ].join('');
+
+  const titles = {
+    agenda: ['Agendamento', 'Agenda por dia e horário, com lançamento do serviço'],
+    overview: ['Visão geral', 'Resumo do recebido e das comissões'],
+    employees: ['Funcionários', 'Cadastro e percentuais de comissão'],
+    services: ['Serviços', 'Catálogo de serviços e valores padrão'],
+    launch: ['Lançar atendimento', 'Registrar um serviço executado'],
+    receber: ['A receber', 'Procedimentos feitos e quanto falta cada cliente pagar'],
+    report: ['Relatório geral', 'Comissões por período e funcionário'],
+  };
+  const [title, subtitle] = titles[currentAdminPage];
+
+  shellLayout({ navHtml, title, subtitle, contentHtml: `<div id="page-inner"></div>` });
+  const inner = document.getElementById('page-inner');
+
+  if(currentAdminPage === 'agenda') inner.innerHTML = await pageAgenda();
+  if(currentAdminPage === 'overview') inner.innerHTML = await pageAdminOverview();
+  if(currentAdminPage === 'employees') inner.innerHTML = await pageAdminEmployees();
+  if(currentAdminPage === 'services') inner.innerHTML = await pageAdminServices();
+  if(currentAdminPage === 'launch') inner.innerHTML = await pageAdminLaunch();
+  if(currentAdminPage === 'receber') inner.innerHTML = await pageAdminReceber();
+  if(currentAdminPage === 'report') inner.innerHTML = await pageAdminReport();
+
+  attachAdminPageHandlers();
+}
+
+/* ------------- ajustes de texto nas telas que já existem ------------- */
+function pagPatch(nome, pares){
+  let src = String(window[nome]);
+  pares.forEach(p => {
+    if(src.indexOf(p[0]) === -1){ console.warn('Ajuste de pagamentos não aplicado em ' + nome + ':', p[0]); return; }
+    src = src.split(p[0]).join(p[1]);
+  });
+  window[nome] = (0, eval)('(' + src + ')');
+}
+
+/* agenda: selo "Pago / Pagou parte / Não pagou" em cada agendamento */
+pagPatch('pageAgenda', [
+  ["${actions.join('')}", "${b.status !== 'cancelado' ? pagChipHtml(b) : ''}${actions.join('')}"],
+]);
+
+/* visão geral: mostra o valor RECEBIDO e quanto ainda falta receber */
+pagPatch('pageAdminOverview', [
+  ['Faturamento (mês)', 'Recebido no mês'],
+  ["['Funcionários ativos', employees.length, 'text-ink dark:text-white'],",
+   "['Funcionários ativos', employees.length, 'text-ink dark:text-white'],\n    ['A receber das clientes', fmtBRL(pagTotalEmAberto()), 'text-rose-600'],"],
+  ['lg:grid-cols-5', 'lg:grid-cols-3'],
+]);
+
+/* relatório geral: "faturamento" passa a se chamar "recebido" */
+pagPatch('pageAdminReport', [
+  ['Faturamento no período', 'Recebido no período'],
+  ['Faturamento</th>', 'Recebido</th>'],
+]);
+
+/* >>> a linha boot(); continua logo abaixo deste bloco <<< */
   boot();
 </script>
 </body>
