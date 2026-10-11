@@ -2017,17 +2017,24 @@ function renderLogin(){
    (a última linha do <script>, depois do bloco "AJUSTE: o % cadastrado...").
    ===================================================================== */
 
+/* =====================================================================
+   AGENDAMENTO ONLINE PELA CLIENTE
+   Como usar: cole este bloco INTEIRO no seu arquivo, logo ANTES da linha
+       boot();
+   (a última linha do <script>, depois do bloco "AJUSTE: o % cadastrado...").
+   ===================================================================== */
+
 const CLI_API = 'https://ecxhalvrziwknjgubcdn.supabase.co/rest/v1/studio_data';
 const CLI_KEY = 'sb_publishable_50x7AAendfE5HgnwOuruqg_HXu1kvrJ';
 
 /* >>> AJUSTE AQUI o funcionamento do studio <<<
    abre / fecha ........ horário de atendimento
-   intervalo ........... duração de cada horário, em minutos (60 = de hora em hora)
+   intervalo ........... de quanto em quanto tempo começa um horário, em minutos (60 = de hora em hora)
    dias ................ dias que atende (0=Dom, 1=Seg, 2=Ter, 3=Qua, 4=Qui, 5=Sex, 6=Sáb)
    diasAdiante ......... até quantos dias à frente a cliente pode marcar
    antecedenciaMin ..... antecedência mínima para marcar no mesmo dia (minutos) */
 const CLI_HORARIO = {
-  abre: '09:00',
+  abre: '08:00',
   fecha: '18:00',
   intervalo: 60,
   dias: [1, 2, 3, 4, 5, 6],
@@ -2035,29 +2042,55 @@ const CLI_HORARIO = {
   antecedenciaMin: 60,
 };
 
+/* >>> DURAÇÃO de cada serviço, em minutos <<<
+   A busca é pelo NOME do serviço cadastrado (sem diferenciar maiúsculas e acentos).
+   Todas as palavras da lista precisam aparecer no nome. O que não estiver aqui usa o padrão (60 min). */
+const CLI_DURACOES = [
+  { palavras: ['alongamento'], min: 180 },
+  { palavras: ['esmalta', 'gel'], min: 120 },
+];
+const CLI_DURACAO_PADRAO = 60;
+
+function cliNorm(t){ return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function cliDuracao(serviceId){
+  const s = dbCache.services.find(x => x.id === serviceId);
+  if(!s) return CLI_DURACAO_PADRAO;
+  const nome = cliNorm(s.name);
+  const regra = CLI_DURACOES.find(r => r.palavras.every(p => nome.includes(p)));
+  return regra ? regra.min : CLI_DURACAO_PADRAO;
+}
+function cliDuracaoTxt(min){
+  const h = Math.floor(min / 60), m = min % 60;
+  return (h ? h + (h === 1 ? ' hora' : ' horas') : '') + (h && m ? ' e ' : '') + (m ? m + ' min' : '');
+}
+
 let cli = { serviceId: '', date: '', employeeId: '', time: '' };
 
 function cliMin(t){ const p = String(t).split(':').map(Number); return p[0] * 60 + p[1]; }
 function cliHora(n){ return String(Math.floor(n / 60)).padStart(2, '0') + ':' + String(n % 60).padStart(2, '0'); }
 function clienteEquipe(){ return dbCache.users.filter(u => u.role === 'employee'); }
 
-/* a funcionária está livre se não tem agendamento ativo dentro da janela daquele horário */
-function clienteLivre(empId, date, slotMin){
-  const fim = slotMin + CLI_HORARIO.intervalo;
-  return !dbCache.bookings.some(b =>
-    b.employeeId === empId && b.date === date && b.status !== 'cancelado' && b.time &&
-    cliMin(b.time) >= slotMin && cliMin(b.time) < fim);
+/* a funcionária está livre se nenhum agendamento ativo dela se sobrepõe ao período do novo serviço
+   (cada agendamento ocupa o tempo do seu serviço: ex. alongamento marcado às 9h bloqueia 9h, 10h e 11h) */
+function clienteLivre(empId, date, slotMin, durMin){
+  const fim = slotMin + durMin;
+  return !dbCache.bookings.some(b => {
+    if(b.employeeId !== empId || b.date !== date || b.status === 'cancelado' || !b.time) return false;
+    const ini = cliMin(b.time);
+    return slotMin < ini + cliDuracao(b.serviceId) && ini < fim;
+  });
 }
 
-function clienteHorarios(date, empId){
+/* só mostra horários em que o serviço termina até o horário de fechamento */
+function clienteHorarios(date, empId, durMin){
   const agora = new Date();
   const nowMin = agora.getHours() * 60 + agora.getMinutes();
   const equipe = clienteEquipe().filter(u => !empId || u.id === empId);
   const fim = cliMin(CLI_HORARIO.fecha);
   const out = [];
-  for(let m = cliMin(CLI_HORARIO.abre); m + CLI_HORARIO.intervalo <= fim; m += CLI_HORARIO.intervalo){
+  for(let m = cliMin(CLI_HORARIO.abre); m + durMin <= fim; m += CLI_HORARIO.intervalo){
     if(date === todayISO() && m < nowMin + CLI_HORARIO.antecedenciaMin) continue;
-    out.push({ time: cliHora(m), livre: equipe.some(u => clienteLivre(u.id, date, m)) });
+    out.push({ time: cliHora(m), livre: equipe.some(u => clienteLivre(u.id, date, m, durMin)) });
   }
   return out;
 }
@@ -2100,11 +2133,11 @@ function clienteRenderSlots(){
   if(!cli.date) return aviso('Escolha uma data para ver os horários.');
   if(cli.date < todayISO()) return aviso('Escolha uma data a partir de hoje.');
   if(!CLI_HORARIO.dias.includes(weekdayIdx(cli.date))) return aviso('Não atendemos neste dia. Escolha outra data.');
-  const slots = clienteHorarios(cli.date, cli.employeeId);
+  const slots = clienteHorarios(cli.date, cli.employeeId, cliDuracao(cli.serviceId));
   if(!slots.some(s => s.livre)) return aviso('Sem horários disponíveis nesta data. Tente outro dia.');
   if(cli.time && !slots.some(s => s.livre && s.time === cli.time)) cli.time = '';
   box.innerHTML = '<div class="grid grid-cols-4 gap-2">' + slots.map(s => {
-    if(!s.livre) return `<span class="text-center text-xs mono rounded-lg border border-line dark:border-[#2C3949] py-2 opacity-40 line-through dark:text-white">${s.time}</span>`;
+    if(!s.livre) return `<span class="text-center text-xs mono rounded-lg border border-line dark:border-[#2C3949] py-1.5 opacity-60 dark:text-white"><span class="line-through">${s.time}</span><span class="block text-[10px] text-rose-600 dark:text-rose-400">ocupado</span></span>`;
     const on = cli.time === s.time;
     return `<button type="button" data-slot="${s.time}" class="text-center text-xs mono font-semibold rounded-lg border py-2 transition ${on ? 'bg-accent text-white border-accent' : 'border-line dark:border-[#2C3949] dark:text-white hover:border-accent'}">${s.time}</button>`;
   }).join('') + '</div>';
@@ -2128,7 +2161,9 @@ async function clienteConfirmar(){
     const svc = dbCache.services.find(s => s.id === cli.serviceId);
     if(!svc) throw new Error('Este serviço não está mais disponível. Atualize a página.');
     const slot = cliMin(cli.time);
-    const candidatos = clienteEquipe().filter(u => (!cli.employeeId || u.id === cli.employeeId) && clienteLivre(u.id, cli.date, slot));
+    const dur = cliDuracao(svc.id);
+    if(slot + dur > cliMin(CLI_HORARIO.fecha)) throw new Error('Esse horário não comporta a duração do serviço. Escolha outro.');
+    const candidatos = clienteEquipe().filter(u => (!cli.employeeId || u.id === cli.employeeId) && clienteLivre(u.id, cli.date, slot, dur));
     if(!candidatos.length) throw new Error('Esse horário acabou de ser ocupado. Escolha outro.');
     // se a cliente não escolheu profissional, fica com quem tem menos atendimentos no dia
     const carga = u => dbCache.bookings.filter(b => b.employeeId === u.id && b.date === cli.date && b.status !== 'cancelado').length;
@@ -2173,7 +2208,7 @@ function clienteAbrir(serviceId){
       <div class="flex items-start justify-between gap-3 mb-4">
         <div class="min-w-0">
           <h2 class="text-sm font-bold dark:text-white">Agendar horário</h2>
-          <p class="text-xs text-muted mt-0.5 truncate">${escapeHtml(s.name)} · <span class="mono">${fmtBRL(s.price)}</span></p>
+          <p class="text-xs text-muted mt-0.5 truncate">${escapeHtml(s.name)} · <span class="mono">${fmtBRL(s.price)}</span> · ${cliDuracaoTxt(cliDuracao(s.id))}</p>
         </div>
         <button type="button" id="cli-fechar" class="w-7 h-7 shrink-0 flex items-center justify-center text-muted hover:text-ink dark:hover:text-white" aria-label="Fechar">✕</button>
       </div>
